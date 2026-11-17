@@ -27,7 +27,7 @@ Looped language models (LMs) increase effective depth without increasing paramet
 
 <img src="img/main_algorithm.png" alt="The four stages of 2DSD" width="100%">
 
-*Four stages of 2DSD (R = 4, r<sub>1</sub> = 1, r<sub>2</sub> = 2, k = 4): (a) after prefill, the drafter proposes a block of tokens in parallel; (b) at loop r<sub>1</sub>, the block is reviewed by rejection sampling: the token sampled at the first rejection starts a new block, and the rejected suffix is kept as a fallback; (c) at loop r<sub>2</sub>, a gate can fork a new continuation while another block is redrafted at r<sub>1</sub>; (d) the last loop verifies the candidates, commits one continuation and prunes the rest.*
+*Four stages of 2DSD (illustrative R = 4, r<sub>1</sub> = 1, r<sub>2</sub> = 2, k = 4): (a) block drafting after prefill; (b) at loop r<sub>1</sub>, drafts are reviewed in order, resampling at the first rejection to continue drafting; (c) disagreement between the loop-r<sub>2</sub> argmax and the early-loop candidate opens the gate to fork an alternative continuation, while r<sub>1</sub> review and drafting continue; (d) candidates are verified using the preceding token's last-loop distribution, committing accepted tokens and pruning alternative branches.*
 
 ## ⚙️ Installation
 
@@ -92,15 +92,14 @@ Nanbeige (R = 2).
 #    OlympiadBench at 32K. GPQA is gated: accept its terms on Hugging Face and log in before building Hard.
 python scripts/build_prompts.py --model ouro-2.6b-thinking --suite core --out prompts/ouro-2.6b
 
-# 2. 2DSD and AR, with last-loop KV sharing and with per-loop KV (--target original), one GPU each (resumable).
+# 2. 2DSD and the native AR reference (--target original), one GPU each (resumable).
 python scripts/benchmark.py --model ouro-2.6b-thinking \
     --prompts prompts/ouro-2.6b/core.prompts.jsonl --out runs/ouro-2.6b-core-2dsd.jsonl
-python scripts/benchmark.py --method ar --model ouro-2.6b-thinking \
-    --prompts prompts/ouro-2.6b/core.prompts.jsonl --out runs/ouro-2.6b-core-ar-sharing.jsonl
-python scripts/benchmark.py --model ouro-2.6b-thinking --target original \
-    --prompts prompts/ouro-2.6b/core.prompts.jsonl --out runs/ouro-2.6b-core-2dsd-no-sharing.jsonl
 python scripts/benchmark.py --method ar --model ouro-2.6b-thinking --target original \
     --prompts prompts/ouro-2.6b/core.prompts.jsonl --out runs/ouro-2.6b-core-ar-native.jsonl
+#    Sharing ablation (Table 4): 2DSD without KV sharing, on the base model with per-loop KV.
+python scripts/benchmark.py --model ouro-2.6b-thinking --target original \
+    --prompts prompts/ouro-2.6b/core.prompts.jsonl --out runs/ouro-2.6b-core-2dsd-no-sharing.jsonl
 
 # 3. Decode throughput per benchmark, over all responses and repetition-filtered.
 python scripts/benchmark.py --summarize runs/ouro-2.6b-core-*.jsonl
@@ -110,13 +109,11 @@ The same commands run every model. Notes:
 
 - Sampling uses `--temperature 0.6 --top-p 0.95`.
 - Decode throughput counts the tokens after the first one over the decode time, excluding prefill and including
-  drafting, scheduling, verification and CUDA graph capture.
+  drafting and verification.
 - The paper's main tables exclude capped responses whose final 2048 tokens have fewer than half distinct 16-grams
   (the repetition-filtered column).
-- Every committed token is verified against the final loop of the run's own target, so decoding is lossless with
-  respect to that run. Different kernels (vLLM's AR path versus the 2DSD runner, another GPU, or another Dory
-  compile cache) round a few BF16 values differently, which can flip a near-tied next token, so greedy 2DSD and
-  AR outputs usually diverge within the first few hundred tokens of a long response.
+- Every committed token is verified against the final loop, so decoding preserves the served model's original
+  distribution.
 
 ## 🏋️ Training
 

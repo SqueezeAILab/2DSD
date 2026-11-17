@@ -1,7 +1,7 @@
 """Depth-conditioned DFlash blocks: sampling, labels and chain mask, loop-context queries and mask.
 
 Notation for one block (code name -> paper name):
-  a      ("anchor" in code; the paper's parent) the last position whose target feature is injected
+  a      ("anchor" in code) the last position whose target feature is injected, just before the paper's anchor
   d      its depth in 1..R; d = R means fully verified, the original DFlash setting
   L_if   in-flight positions a-L_if .. a-1 before it: drafted but not yet verified
   v      last verified position (a for d = R, else a - L_if - 1); positions <= v use loop-R features

@@ -3,7 +3,7 @@
 2DSD trains two components:
 
 - **Shared-KV adaptation** (`training.kd`, Appendix C): adapt Ouro and Nanbeige to last-loop KV sharing
-  with a query window of W = 64 through distillation from the original model.
+  with a local window of W = 64 through self-distillation from the original model.
 - **Depth-conditioned drafters** (`training.drafter`, Appendix D.4): train and export DFlash drafters
   for the shared-KV and original targets. Dory uses one drafter for both targets and needs no KD.
 

@@ -15,7 +15,7 @@ Example::
     [result] = engine.generate([prompt_ids], max_total_tokens=8192)
     print(result["output_ids"], result["decode_seconds"])
 
-Method presets (paper Sec. 5.1): ``2dsd`` is Stage 2b with (r1, r2) = (1, 2)
+Method presets (paper Sec. 5.1; Nanbeige: App. E.1): ``2dsd`` is Stage 2b with (r1, r2) = (1, 2)
 and block size 16 on R=4 targets (Ouro, Dory), and Stage 1 with r1 = 1 on R=2
 targets (Nanbeige).
 
@@ -27,7 +27,7 @@ and the 2DSD runner's compiled nGPT blocks); Ouro and
 Nanbeige run CUDA graphs without torch.compile (the settings of the paper's
 measurements).
 ``stage``, ``block_size``, ``d1`` and ``d2`` select the ablation variants
-(Stage 1: early review only; Stage 2a: plus promotion; Stage 2b: plus forking).
+(Stage 1: early only; Stage 2a: plus deeper promotion; Stage 2b: plus deeper forking).
 With ``block_size=1`` no drafter runs (depth-axis speculation only).
 """
 

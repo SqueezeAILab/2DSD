@@ -7,9 +7,10 @@ skipped, and --out must hold only results of the same run (model, revision,
 drafter, method, sampling, 2DSD settings, KV policy and prompts file). Then
 prints decode throughput per benchmark, as in the paper (App. D.2): tokens
 after the first one (which prefill produces) over the decode time, excluding
-prefill and including drafting, scheduling, verification and CUDA graph capture.
-"repetition-filtered" excludes capped responses whose final 2048 tokens have
-fewer than half distinct 16-grams.
+prefill and including drafting and verification. AIME24 and AIME25 are
+reported together as aime24/25, as in the paper's tables. "repetition-filtered"
+excludes capped responses whose final 2048 tokens have fewer than half distinct
+16-grams.
 
 Examples (the paper's 2DSD run and its native AR reference):
   python scripts/benchmark.py --model ouro-1.4b-thinking \\
@@ -265,13 +266,16 @@ def capped(row: dict) -> bool:
     return not row["stopped_by_eos"] and len(row["output_ids"]) >= row["max_new"]
 
 
+TABLE_BENCHMARK = {"aime24": "aime24/25", "aime25": "aime24/25"}  # one column in the paper's tables
+
+
 def summarize(paths: list[Path]) -> None:
     print(f"{'run':40s} {'benchmark':12s} {'n':>5s} {'tok/s':>9s} {'tok/s (rep.-filtered)':>22s}")
     for path in paths:
         rows = read_jsonl(path)
         groups = collections.defaultdict(list)
         for row in rows:
-            groups[row["benchmark"]].append(row)
+            groups[TABLE_BENCHMARK.get(row["benchmark"], row["benchmark"])].append(row)
             groups["all"].append(row)
         for name, items in sorted(groups.items(), key=lambda kv: (kv[0] == "all", kv[0])):
             def rate(selected):

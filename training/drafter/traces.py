@@ -7,7 +7,7 @@ online at the loop onset (loop_onset below) and saved up to that onset with fini
 so no budget is spent on the repetition.
 
 --variant w64 is the shared-KV checkpoint served with its trained read rule (native single-pass
-prompt, last-loop KV outside the W-token query band); the vLLM fork applies it because the
+prompt, last-loop KV outside the W-token local window); the vLLM fork applies it because the
 checkpoint's config.json declares loopedtf_kv_policy / loopedtf_kv_window (training.kd.fix_config
 adds them to older exports; --kv-policy forces them through hf_overrides for a checkpoint that
 lacks them). --variant original is the per-loop-KV original model. Both drafters of a model in the

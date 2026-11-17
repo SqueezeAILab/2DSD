@@ -53,6 +53,23 @@ class Helpers(unittest.TestCase):
         line = [l for l in out.getvalue().splitlines() if " all " in l][0]
         self.assertIn("10.0", line)  # (10 + 30) tokens / (1 + 3) s
 
+    def test_summary_reports_aime24_and_aime25_together(self):
+        rows = [{"id": "a", "benchmark": "aime24", "output_ids": [0] * 11, "decode_seconds": 1.0, "max_new": 99,
+                 "stopped_by_eos": True},
+                {"id": "b", "benchmark": "aime25", "output_ids": [0] * 31, "decode_seconds": 1.0, "max_new": 99,
+                 "stopped_by_eos": True}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            out = io.StringIO()
+            with redirect_stdout(out):
+                benchmark.summarize([path])
+        lines = out.getvalue().splitlines()
+        self.assertFalse(any(" aime24 " in l or " aime25 " in l for l in lines))
+        line = [l for l in lines if " aime24/25 " in l][0]
+        self.assertIn("    2 ", line)
+        self.assertIn("20.0", line)  # (10 + 30) tokens / (1 + 1) s
+
     def test_prepare_append_drops_a_torn_tail_and_ends_the_last_record(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.jsonl"
