@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "model": "ouro-1.4b-thinking",
+  "window": 64,
+  "student_passes": 2,
+  "prompt": "native-one-pass",
+  "teacher_mode": "online_full",
+  "temperature": 1.0,
+  "objective": "forward-kl-response-token-mean-no-ce",
+  "sequence_length": 32768,
+  "input_token_budget": 128000000,
+  "effective_batch_rows": 16,
+  "seed": 20260930,
+  "checkpoint_layers": 2,
+  "head_chunk_size": 128,
+  "optimizer": {
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "eps": 1e-08,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0
+  },
+  "schedule": {
+    "peak_lr": 1e-05,
+    "min_lr": 1e-06,
+    "warmup_fraction": 0.05
+  },
+  "evaluation": {
+    "every_updates": 10,
+    "documents_per_domain": 4,
+    "max_document_tokens": 32768,
+    "exact_max_document_tokens": 8192,
+    "exact_documents": 2,
+    "exact_short_response_tokens": 512,
+    "inference_windows": [
+      1,
+      16,
+      64,
+      128
+    ]
+  },
+  "recovery_every_updates": 10
+}

@@ -1,0 +1,16 @@
+{
+  "upstream_url": "https://github.com/vllm-project/vllm",
+  "upstream_tag": "v0.26.0",
+  "upstream_commit": "568afb3a13806beb53bb2e6bd518269357b237c0",
+  "version": "0.26.0+2dsd",
+  "nanbeige_source": {
+    "url": "https://github.com/Nanbeige/vllm",
+    "commit": "62f6de733d7ae63b759329993bc209e67afdf431",
+    "file": "vllm/model_executor/models/nanbeige.py"
+  },
+  "kernel_wheel": {
+    "filename": "vllm-0.26.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "url": "https://files.pythonhosted.org/packages/20/96/86edd288415aafc2952bbb969b5ef4e8c58e5525185b60320730276921e6/vllm-0.26.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "sha256": "adb1e4c9b46d0dfdb094121ae5aad670a42412dd813ed4e5db069ed6a15006de"
+  }
+}

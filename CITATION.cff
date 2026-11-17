@@ -1,0 +1,52 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "2DSD: Two-Dimensional Speculative Decoding for Looped Language Models"
+type: software
+license: Apache-2.0
+authors:
+  - given-names: Minseo
+    family-names: Kim
+  - given-names: Arnav
+    family-names: Chavan
+  - given-names: Minhyuk
+    family-names: Seo
+  - given-names: Yuezhou
+    family-names: Hu
+  - given-names: Minjae
+    family-names: Lee
+  - given-names: Wonjun
+    family-names: Kang
+  - given-names: Michael W.
+    family-names: Mahoney
+  - given-names: Kurt
+    family-names: Keutzer
+  - given-names: Coleman
+    family-names: Hooper
+  - given-names: Amir
+    family-names: Gholami
+preferred-citation:
+  type: article
+  title: "2DSD: Two-Dimensional Speculative Decoding for Looped Language Models"
+  year: 2026
+  authors:
+    - given-names: Minseo
+      family-names: Kim
+    - given-names: Arnav
+      family-names: Chavan
+    - given-names: Minhyuk
+      family-names: Seo
+    - given-names: Yuezhou
+      family-names: Hu
+    - given-names: Minjae
+      family-names: Lee
+    - given-names: Wonjun
+      family-names: Kang
+    - given-names: Michael W.
+      family-names: Mahoney
+    - given-names: Kurt
+      family-names: Keutzer
+    - given-names: Coleman
+      family-names: Hooper
+    - given-names: Amir
+      family-names: Gholami
+  # TODO: add the arXiv identifier once assigned.

@@ -1,0 +1,49 @@
+{
+  "_comment": "Hugging Face repositories of each registry name. repo_id is the base model, pinned to the revision of the paper's numbers because its main branch can change the chat template or remote code; w64 is the shared-KV (W = 64) target and drafters hold the drafter of each target. Dory shares without adaptation: both of its targets are the pinned base checkpoint with configuration overrides (loops 4, kv_policy w64 or native), so it has no w64 repository, and one drafter serves both.",
+  "models": {
+    "ouro-1.4b-thinking": {
+      "repo_id": "ByteDance/Ouro-1.4B-Thinking",
+      "revision": "3aaa2224253a92ca45cf2e3d427c360e1ef9c93d",
+      "family": "ouro",
+      "loops": 4,
+      "w64": "minseo25/2dsd-ouro-1.4b-thinking-shared-kv",
+      "drafters": {
+        "w64": "minseo25/2dsd-ouro-1.4b-thinking-shared-kv-dflash-drafter",
+        "original": "minseo25/2dsd-ouro-1.4b-thinking-dflash-drafter"
+      }
+    },
+    "ouro-2.6b-thinking": {
+      "repo_id": "ByteDance/Ouro-2.6B-Thinking",
+      "revision": "f1edd81e7ac41355db670500ceaf204e0f73af68",
+      "family": "ouro",
+      "loops": 4,
+      "w64": "minseo25/2dsd-ouro-2.6b-thinking-shared-kv",
+      "drafters": {
+        "w64": "minseo25/2dsd-ouro-2.6b-thinking-shared-kv-dflash-drafter",
+        "original": "minseo25/2dsd-ouro-2.6b-thinking-dflash-drafter"
+      }
+    },
+    "nanbeige4.2-3b": {
+      "repo_id": "Nanbeige/Nanbeige4.2-3B",
+      "revision": "b82e54bd609793562a75cbf9337970a93369eab5",
+      "family": "nanbeige",
+      "loops": 2,
+      "w64": "minseo25/2dsd-nanbeige4.2-3b-shared-kv",
+      "drafters": {
+        "w64": "minseo25/2dsd-nanbeige4.2-3b-shared-kv-dflash-drafter",
+        "original": "minseo25/2dsd-nanbeige4.2-3b-dflash-drafter"
+      }
+    },
+    "dory1.0-4b": {
+      "repo_id": "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16",
+      "revision": "f6c832e6963ddb74f62c75813a3e8c74b1af67b1",
+      "family": "dory",
+      "loops": 4,
+      "w64": null,
+      "drafters": {
+        "w64": "minseo25/2dsd-dory1.0-4b-dflash-drafter",
+        "original": "minseo25/2dsd-dory1.0-4b-dflash-drafter"
+      }
+    }
+  }
+}
