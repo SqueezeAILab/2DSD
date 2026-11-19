@@ -3,6 +3,7 @@ message: "If you use this software, please cite the paper below."
 title: "2DSD: Two-Dimensional Speculative Decoding for Looped Language Models"
 type: software
 license: Apache-2.0
+repository-code: "https://github.com/SqueezeAILab/2DSD"
 authors:
   - given-names: Minseo
     family-names: Kim
@@ -25,7 +26,7 @@ authors:
   - given-names: Amir
     family-names: Gholami
 preferred-citation:
-  type: article
+  type: generic
   title: "2DSD: Two-Dimensional Speculative Decoding for Looped Language Models"
   year: 2026
   authors:
@@ -49,4 +50,4 @@ preferred-citation:
       family-names: Hooper
     - given-names: Amir
       family-names: Gholami
-  # TODO: add the arXiv identifier once assigned.
+  url: "https://github.com/SqueezeAILab/2DSD"

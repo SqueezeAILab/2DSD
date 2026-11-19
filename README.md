@@ -19,8 +19,7 @@
 
 ## 🔔 Updates
 
-- **TBD** Code, shared-KV targets and drafters released.
-- **TBD** 2DSD is on arXiv.
+- **Nov 19, 2026** Code, shared-KV targets and drafters released.
 
 ## 🔍 Overview
 
@@ -149,12 +148,12 @@ Both recipes are in [`training/README.md`](training/README.md):
 If you find 2DSD useful, please consider citing:
 
 ```bibtex
-@article{kim2026twodsd,
-  title   = {2DSD: Two-Dimensional Speculative Decoding for Looped Language Models},
-  author  = {Kim, Minseo and Chavan, Arnav and Seo, Minhyuk and Hu, Yuezhou and Lee, Minjae and
-             Kang, Wonjun and Mahoney, Michael W. and Keutzer, Kurt and Hooper, Coleman and Gholami, Amir},
-  journal = {arXiv preprint arXiv:TBD},
-  year    = {2026}
+@misc{kim2026twodsd,
+  title  = {2DSD: Two-Dimensional Speculative Decoding for Looped Language Models},
+  author = {Kim, Minseo and Chavan, Arnav and Seo, Minhyuk and Hu, Yuezhou and Lee, Minjae and
+            Kang, Wonjun and Mahoney, Michael W. and Keutzer, Kurt and Hooper, Coleman and Gholami, Amir},
+  year   = {2026},
+  url    = {https://github.com/SqueezeAILab/2DSD}
 }
 ```
 
