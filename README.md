@@ -12,6 +12,7 @@
 <sup>\*</sup>Equal contribution &nbsp;&nbsp; <sup>†</sup>Equal advising
 
 ![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)
+[![Paper](https://img.shields.io/badge/Paper-PDF-blue.svg)](paper/2DSD.pdf)
 [![Hugging Face models](https://img.shields.io/badge/%F0%9F%A4%97%20Models-2DSD-yellow)](https://huggingface.co/collections/minseo25/2dsd-6afb8af3e28a6edb66fa4434)
 
 </div>
