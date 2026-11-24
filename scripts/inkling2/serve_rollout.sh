@@ -11,10 +11,11 @@ set -euo pipefail
 readonly IMAGE="vllm/vllm-openai@sha256:c2dc759f5984f69c1e2418c6af7c26eb756f5ed2a8934c768ae1253645d1449e"
 readonly DEFAULT_REPO="thinkingmachines/Inkling-2-Mini"
 readonly DEFAULT_REVISION="1fb4134b9a74f9681054f4ef82e4bf1f458a2337"
+readonly VARLOOP_REPO="thinkingmachines/TML-d24-varloop-research"
 
 usage() {
   cat <<EOF
-usage: serve_rollout.sh [--dry-run] [--repo ORG/NAME] [--revision SHA] [--hf-home DIR]
+usage: serve_rollout.sh [--dry-run] [--repo ORG/NAME] [--revision SHA] [--name NAME] [--hf-home DIR]
                         [--max-model-len N] [--wait SECONDS] [--hopper-patches DIR]
                         GPU PORT [vllm serve options]
 
@@ -31,6 +32,9 @@ the image's attention kernels use Hopper hardware features and fail on older car
   --dry-run         print the docker command and exit.
   --repo            Hugging Face repository of the checkpoint (default ${DEFAULT_REPO}).
   --revision        its snapshot (default ${DEFAULT_REVISION}).
+  --name            model name the server answers to, which the clients ask for: by default the registry name
+                    of the repository (inkling-2-mini, or inkling-2-mini-varloop for ${VARLOOP_REPO});
+                    required for any other repository. One checkpoint, one name: traces are saved under it.
   --hf-home         Hugging Face home that holds hub/models--ORG--NAME (default \$HF_HOME, else
                     ~/.cache/huggingface). The model's cache directory is mounted read-only.
   --max-model-len   prompt + output tokens of one request (default 16384, the trace budget).
@@ -61,6 +65,7 @@ fail() {
 dry_run=0
 repo="${DEFAULT_REPO}"
 revision="${DEFAULT_REVISION}"
+served=""
 hf_home="${HF_HOME:-${HOME}/.cache/huggingface}"
 max_model_len=16384
 wait_seconds=900
@@ -68,11 +73,12 @@ hopper=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry_run=1; shift ;;
-    --repo|--revision|--hf-home|--max-model-len|--wait|--hopper-patches)
+    --repo|--revision|--name|--hf-home|--max-model-len|--wait|--hopper-patches)
       [[ $# -ge 2 && -n "$2" ]] || fail "$1 needs a value"
       case "$1" in
         --repo) repo="$2" ;;
         --revision) revision="$2" ;;
+        --name) served="$2" ;;
         --hf-home) hf_home="$2" ;;
         --max-model-len) max_model_len="$2" ;;
         --wait) wait_seconds="$2" ;;
@@ -99,6 +105,14 @@ shift 2
 [[ "${wait_seconds}" =~ ^[0-9]+$ ]] || fail "--wait must be a number of seconds"
 [[ "${repo}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "--repo must be ORG/NAME, got '${repo}'"
 [[ "${revision}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--revision must be a snapshot name, got '${revision}'"
+if [[ -z "${served}" ]]; then
+  case "${repo}" in
+    "${DEFAULT_REPO}") served="inkling-2-mini" ;;
+    "${VARLOOP_REPO}") served="inkling-2-mini-varloop" ;;
+    *) fail "--name is required for ${repo}: the model name its clients ask for" ;;
+  esac
+fi
+[[ "${served}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "--name must be a model name, got '${served}'"
 
 # The files serve_official.sh --make-hopper-patches writes, and where the image keeps them.
 readonly SITE="/usr/local/lib/python3.14/dist-packages"
@@ -147,7 +161,7 @@ if [[ -n "${hopper}" ]]; then
 fi
 command+=(--entrypoint python3 "${IMAGE}"
   -m vllm.entrypoints.cli.main serve "/hf/hub/${cache_name}/snapshots/${revision}"
-  --served-model-name inkling-2-mini
+  --served-model-name "${served}"
   --max-model-len "${max_model_len}"
   --host 127.0.0.1
   --port "${port}"

@@ -163,10 +163,10 @@ class _DSparkHeads:
         slot in a hundred."""
         return base if self.wide_base else base.to(self.w2.dtype)
 
-    def step(self, hidden, previous, state, w2=None):
+    def bias(self, hidden, previous, state, w2=None):
         """One slot of n blocks: its backbone states [n, H], the tokens before it [n] and the recurrent
-        state [n, r] -> the logit bias [n, V], confidence logits [n] and the next state. ``w2`` (rows of
-        the Markov projection) gives the bias of those tokens only."""
+        state [n, r] -> the logit bias [n, V] and the next state. ``w2`` (rows of the Markov projection)
+        gives the bias of those tokens only."""
         embedding = latent = self.w1[previous]
         if self.kind == "gated":
             latent = torch.sigmoid(F.linear(torch.cat((hidden, embedding), -1), *self.projection)) * embedding
@@ -174,9 +174,19 @@ class _DSparkHeads:
             gate, candidate, latent = F.linear(torch.cat((state, embedding, hidden), -1), *self.projection).chunk(3, -1)
             gate = torch.sigmoid(gate)
             state, latent = gate * state + (1.0 - gate) * torch.tanh(candidate), torch.tanh(latent)
+        return latent @ (self.w2 if w2 is None else w2).T, state
+
+    def confidence_logits(self, hidden, previous):
+        """Confidence logits [...] of slots from their backbone states [..., H] and the tokens before them
+        [...]. They do not enter the next slot, so a loop over slots can take them for all slots at once."""
         weight, bias = self.confidence
-        projection = self.w2 if w2 is None else w2
-        return latent @ projection.T, torch.cat((hidden, embedding), -1) @ weight + bias, state
+        return torch.cat((hidden, self.w1[previous]), -1) @ weight + bias
+
+    def step(self, hidden, previous, state, w2=None):
+        """``bias`` and ``confidence_logits`` of one slot: the logit bias [n, V], confidence logits [n] and
+        the next state."""
+        bias, state = self.bias(hidden, previous, state, w2)
+        return bias, self.confidence_logits(hidden, previous), state
 
 
 @dataclass
@@ -466,15 +476,17 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         base = heads.draft_base(readout(loop.hidden)).view(count, slots, -1)
         previous = loop.head
         state = loop.hidden.new_zeros(count, heads.w1.shape[1])
-        tokens, confidences = [], []
+        tokens, before = [], []
         for slot in range(slots):
-            bias, confidence, state = heads.step(hidden[:, slot], previous, state, w2)
+            before.append(previous)
+            bias, state = heads.bias(hidden[:, slot], previous, state, w2)
             previous = (base[:, slot] + bias.to(base.dtype)).argmax(-1)
             if ids is not None:
                 previous = ids[previous]
             tokens.append(previous)
-            confidences.append(torch.sigmoid(confidence.float()))
-        return torch.stack(tokens, 1), torch.stack(confidences, 1)
+        # The confidence head after the loop, for every slot in one product: it is no input of a later slot.
+        confidence = heads.confidence_logits(hidden, torch.stack(before, 1))
+        return torch.stack(tokens, 1), torch.sigmoid(confidence.float())
 
     def configure_draft_vocabulary(self, ids, readout):
         """Restrict a DSpark drafter's drafts to the sorted token IDs ``ids``.

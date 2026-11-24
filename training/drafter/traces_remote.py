@@ -163,6 +163,22 @@ async def stream_one(session, server, body, eos):
     return ids, reason, None, len(ids), added
 
 
+REPO_ID = re.compile(r"[\w.-]+/[\w.-]+")
+
+
+def served_checkpoint(root, target):
+    """Whether a server's model root is the checkpoint `target` ("org/name" or "org/name@revision"): True or
+    False when the root is a Hugging Face snapshot path or repository id and the target is so named, None
+    when one of them does not say (another layout, a target named otherwise)."""
+    repo, _, revision = str(target).partition("@")
+    if not isinstance(root, str) or not REPO_ID.fullmatch(repo):
+        return None
+    if "/snapshots/" in root:
+        cache, _, snapshot = root.rstrip("/").rpartition("/snapshots/")
+        return cache.endswith("models--" + repo.replace("/", "--")) and revision in ("", snapshot)
+    return root == repo if REPO_ID.fullmatch(root) else None
+
+
 async def serve(out, server, concurrency, refill):
     import aiohttp
 
@@ -179,11 +195,18 @@ async def serve(out, server, concurrency, refill):
             async with session.get(f"{server}/version") as response:
                 engine = f"vllm {(await response.json())['version']} (server)"
             async with session.get(f"{server}/v1/models") as response:
-                served = [m["id"] for m in (await response.json())["data"]]
+                cards = (await response.json())["data"]
+            served = [m["id"] for m in cards]
             name = settings.get("served_model") or model
             if name not in served:
                 raise RuntimeError(f"{server} serves {served}, not {name}. If one of them is {model}, say so at "
                                    "init with --served-model")
+            # The name is the server's own choice: where its model root names a checkpoint, it must be
+            # this queue's target, or the traces of another checkpoint would be saved as this model's.
+            root = next(m.get("root") for m in cards if m["id"] == name)
+            if served_checkpoint(root, settings["target"]) is False:
+                raise RuntimeError(f"{server} serves {root} under the name {name}, not {settings['target']}, "
+                                   f"the checkpoint of {model}")
             pending = read_rows(queue / "pending.jsonl")
             print(json.dumps({"server": server, "model": model, "served": name, "engine": engine,
                               "budget": budget, "concurrency": concurrency}), flush=True)

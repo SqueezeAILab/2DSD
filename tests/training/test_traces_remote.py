@@ -33,8 +33,9 @@ def response_of(prompt, max_tokens):
 
 
 class Stub:
-    def __init__(self):
+    def __init__(self, root=None):
         self.calls, self.failed, self.disconnects, self.bodies = 0, set(), 0, []
+        self.root = root  # the model root the server reports (vLLM: the path or repository it was started with)
 
     async def completions(self, request):
         body = await request.json()
@@ -69,7 +70,8 @@ class Stub:
             return web.json_response({"version": "0.test"})
 
         async def models(_):
-            return web.json_response({"data": [{"id": "served-mini"}]})
+            card = {"id": "served-mini"} if self.root is None else {"id": "served-mini", "root": self.root}
+            return web.json_response({"data": [card]})
 
         app = web.Application()
         app.add_routes([web.post("/v1/completions", self.completions), web.get("/version", version),
@@ -77,12 +79,12 @@ class Stub:
         return app
 
 
-def write_queue(out, items, budget, served="served-mini"):
+def write_queue(out, items, budget, served="served-mini", target_name="mini@test"):
     """A queue as traces.init leaves it, without rendering prompts."""
     target = out / "target"
     target.mkdir()
     (target / "config.json").write_text(json.dumps({"model_type": "inkling2_loop"}))
-    settings = {"model": MODEL, "variant": "original", "target_path": str(target), "target": "mini@test",
+    settings = {"model": MODEL, "variant": "original", "target_path": str(target), "target": target_name,
                 "prompts": str(out), "budget": budget, "pools": ["train"], "sampled_fraction": 0.25,
                 "kv_policy": "full", "window": None, "served_model": served, "gpu_lock_dir": "",
                 "eos_token_ids": [EOS], "target_config_sha256": "abc"}
@@ -195,6 +197,25 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "serves .'served-mini'., not " + MODEL):
             asyncio.run(run_clients(out, Stub()))
         self.assertEqual(list((out / "raw").glob("*.jsonl")), [])
+
+    def test_a_server_of_another_checkpoint_is_refused_whatever_its_name(self):
+        """The served name is the server's own choice. Where its model root names a checkpoint (the snapshot
+        path serve_rollout.sh starts it with), another repository or revision than the queue's target is
+        refused before a request is claimed: its traces would be saved as this model's."""
+        snapshots = "/hf/hub/models--org--looped/snapshots/"
+        for root, refused in ((snapshots + "abc", False), ("/hf/hub/models--org--other/snapshots/abc", True),
+                              (snapshots + "def", True), ("org/other", True), ("org/looped", False),
+                              ("/models/local-copy", False)):
+            with self.subTest(root=root), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                write_queue(out, [item(0, 1)], 4096, target_name="org/looped@abc")
+                if refused:
+                    with self.assertRaisesRegex(RuntimeError, "under the name served-mini, not org/looped@abc"):
+                        asyncio.run(run_clients(out, Stub(root)))
+                    self.assertEqual(list((out / "raw").glob("*.jsonl")), [])
+                else:
+                    asyncio.run(run_clients(out, Stub(root)))
+                    self.assertEqual(len(traces.read_jsonl_partial(next((out / "raw").glob("*.jsonl")))), 1)
 
     def test_a_failed_attempt_is_retried(self):
         _, stub, rows = self.run_queue([item(0, 5), item(1, 1)])

@@ -583,6 +583,12 @@ class TwoDSD:
             drafter = None
         if settings["k"] > 1 and drafter is None:
             raise ValueError("A drafter export is required for block_size > 1")
+        # The executor's own checks, before a checkpoint of tens of GiB loads.
+        if not engine_kwargs.get("frozen_suffix", True) and settings["stage"] != "stage1":
+            raise ValueError("Only greedy Stage 1 can drop the suffix its review rejects")
+        confidence = engine_kwargs.get("draft_confidence")
+        if confidence is not None and not 0 <= float(confidence) <= 1:
+            raise ValueError("draft_confidence is a probability")
         if not Path(model).is_dir():
             from huggingface_hub import snapshot_download
 

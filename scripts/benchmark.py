@@ -154,7 +154,7 @@ def run_identity(args, prompts_bytes: bytes) -> dict:
         identity["humming"] = True
     if getattr(args, "engine_kwargs", {}).get("drafter_of_other_target"):  # a deliberate transfer
         identity["drafter_of_other_target"] = True
-    # Another number of passes is another model output; the checkpoint's own count is not recorded.
+    # Another number of passes is another model output; a registry name's own count is not recorded.
     for key in ("loops", "drafter_of_other_loops"):
         if getattr(args, "engine_kwargs", {}).get(key):
             identity[key] = args.engine_kwargs[key]
@@ -403,6 +403,9 @@ def main(argv=None) -> None:
         return
     if not (args.model and args.prompts and args.out):
         parser.error("--model, --prompts and --out are required")
+    own = registry.entry(args.model) if args.model in registry.names() else {}
+    if own.get("family") == "inkling2" and args.loops == own["loops"]:
+        args.loops = None  # the checkpoint's own count: the run of no --loops, and recorded as such
     try:
         resolved = registry.serving(args.model, args.target, revision=args.revision, drafter=args.drafter,
                                     kv_policy=args.kv_policy, drafter_kind=args.drafter_kind,

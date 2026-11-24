@@ -197,8 +197,8 @@ python scripts/check_drafter_export.py --model ouro-1.4b-thinking --target w64 -
 
 The fork cannot serve Inkling 2, so its traces come from the official vLLM build:
 `scripts/inkling2/serve_rollout.sh` starts one OpenAI-compatible server of the checkpoint per GPU in the
-vendor's image (Docker; the servers answer to the name `inkling-2-mini` with the trace budget of 16,384
-tokens), and one client per server works through the queue. The drafter trains on the per-loop model
+vendor's image (Docker; a server answers to the registry name of its checkpoint, with the trace budget of
+16,384 tokens), and one client per server works through the queue. The drafter trains on the per-loop model
 with a DSpark recipe ([inkling-2-mini.json](../configs/drafter/inkling-2-mini.json),
 [inkling-2-mini-varloop.json](../configs/drafter/inkling-2-mini-varloop.json)).
 
@@ -218,8 +218,9 @@ python -m training.drafter.export --checkpoint runs/drafter/inkling-2-mini/dspar
 
 `--target-tensor-cores` runs the frozen target about four times faster on an H100; an 80 GB card needs
 `--micro-blocks 128` with it. For the variable-loop checkpoint pass `--repo` and `--revision` of
-`configs/models.json` to `serve_rollout.sh`, `--model inkling-2-mini-varloop --served-model inkling-2-mini`
-to `traces_remote launch` and `--config configs/drafter/inkling-2-mini-varloop.json` to the trainer.
+`configs/models.json` to `serve_rollout.sh` (its server then answers to `inkling-2-mini-varloop`),
+`--model inkling-2-mini-varloop` to `traces_remote launch` and
+`--config configs/drafter/inkling-2-mini-varloop.json` to the trainer.
 
 ## Tests
 

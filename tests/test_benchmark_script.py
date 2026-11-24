@@ -527,6 +527,9 @@ class Inkling2(BenchmarkRun):
         self.run_benchmark("--limit", "1", **base)
         self.assertEqual(self.engines.engine_kwargs[-1], {})
         self.assertNotIn("loops", self.lines()[0]["run_identity"])
+        self.run_benchmark("--loops", "3", **base)  # the registry's own count is the same run: it resumes
+        self.assertEqual(self.engines.engine_kwargs[-1], {})
+        self.assertNotIn("loops", self.lines()[-1]["run_identity"])
         with self.assertRaises(SystemExit):
             self.run_benchmark("--loops", "4", **base)
         self.assertIn("loops", self.stderr.getvalue())

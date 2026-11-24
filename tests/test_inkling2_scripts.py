@@ -631,6 +631,21 @@ class ServeRollout(Containers):
         self.assertFalse([value for value in argv if "dist-packages" in value])  # no patch without the option
         self.assertIsNone(self.started())
 
+    def test_the_served_name_is_the_registry_name_of_the_checkpoint(self):
+        """A client asks for its model by registry name, so a server of the variable-loop checkpoint does not
+        answer to inkling-2-mini (its traces would be saved as that model's); another repository needs --name."""
+        entry = json.loads((ROOT / "configs" / "models.json").read_text())["models"]["inkling-2-mini-varloop"]
+        varloop = ("--repo", entry["repo_id"], "--revision", entry["revision"])
+        argv = shlex.split(self.rollout("--dry-run", *varloop, "2", "8102").stdout)
+        self.assertEqual(argv[argv.index("--served-model-name") + 1], "inkling-2-mini-varloop")
+        self.assertIn(f"/snapshots/{entry['revision']}", " ".join(argv))
+        other = self.rollout("--dry-run", "--repo", "org/looped", "--revision", "abc", "2", "8102")
+        self.assertEqual(other.returncode, 2)
+        self.assertIn("--name is required for org/looped", other.stderr)
+        argv = shlex.split(self.rollout("--dry-run", "--repo", "org/looped", "--revision", "abc", "--name", "looped",
+                                        "2", "8102").stdout)
+        self.assertEqual(argv[argv.index("--served-model-name") + 1], "looped")
+
     def test_hopper_patches_are_mounted_over_the_image_s_files(self):
         patches = self.root / "hopper"
         missing = self.rollout("--dry-run", "--hopper-patches", str(patches), "2", "8102")
