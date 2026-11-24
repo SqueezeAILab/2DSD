@@ -296,6 +296,38 @@ class EngineOptions(unittest.TestCase):
         with patch.object(inkling2_humming, "available", return_value=True):
             self.assertIsNone(inkling2_slow_path({}))
 
+    def test_inkling2_default_schedule_follows_the_passes_that_run(self):
+        """Stage 2b at (1, 2) for three passes, Stage 1 at r1 = 2 for four, Stage 2b at (2, 4) for five: the
+        fastest of the full evaluation; Stage 1 at r1 = ceil(R / 2) elsewhere. The block size is Inkling2's."""
+        from vllm.v1.spec_decode.twodsd import inkling2_preset
+
+        self.assertEqual(inkling2_preset(3), preset("inkling2_loop"))
+        self.assertEqual(preset("inkling2_loop"), {"stage": "stage2b", "k": 8, "d1": 1, "d2": 2})
+        self.assertEqual(inkling2_preset(5), {"stage": "stage2b", "k": 8, "d1": 2, "d2": 4})
+        for loops, d1 in ((1, 1), (2, 1), (4, 2), (6, 3)):
+            with self.subTest(loops=loops):
+                chosen = inkling2_preset(loops)
+                self.assertEqual((chosen["stage"], chosen["d1"], chosen["k"]), ("stage1", d1, 8))
+
+    def test_only_the_targets_measured_faster_elsewhere_leave_their_preset(self):
+        """A run that names no schedule: Ouro-1.4B-Thinking (the 24-layer Ouro) drafts at r1 = 2 without deeper
+        branching, Inkling2 follows the passes it runs; Ouro-2.6B, Dory, Nanbeige and Inkling2 at three passes
+        keep their preset."""
+        from vllm.v1.spec_decode.twodsd import best_schedule
+
+        ouro = lambda layers: self.checkpoint({"model_type": "ouro", "num_hidden_layers": layers, "total_ut_steps": 4})
+        self.assertEqual(best_schedule(ouro(24)), {"stage": "stage1", "d1": 2})
+        self.assertEqual(best_schedule(ouro(48)), {})
+        for config in ({"model_type": "dory"}, {"model_type": "nanbeige", "num_hidden_layers": 24}):
+            self.assertEqual(best_schedule(self.checkpoint(config)), {})
+        inkling = self.checkpoint({"model_type": "inkling2_loop", "text_config": {"loop_config": MINI_LOOP}})
+        self.assertEqual(best_schedule(inkling), {})
+        self.assertEqual(best_schedule(inkling, loops=3), {})
+        self.assertEqual(best_schedule(inkling, loops=4), {"stage": "stage1", "d1": 2})
+        self.assertEqual(best_schedule(inkling, loops=5), {"stage": "stage2b", "d1": 2, "d2": 4})
+        with self.assertRaisesRegex(ValueError, SUPPORTED):
+            best_schedule(self.checkpoint({"model_type": "qwen3"}))
+
     def test_an_unknown_model_type_gets_no_engine_options_or_preset(self):
         """Guards the old defaults (Ouro's graph-only engine and R = 4 preset) for unsupported checkpoints."""
         for model_type in ("qwen3", "inkling2"):
@@ -407,6 +439,16 @@ class Inkling2EndToEnd(unittest.TestCase):
                 self.assertEqual(result["output_ids"], want)
                 self.assertEqual(result["settings"]["num_loops"], 4)
         self.assertEqual(self.generate(model, loops=4, plain=True)["settings"]["control"], "autoregressive")
+        # Without a stage or a depth the schedule is that of the passes that run; a named one keeps the preset
+        # for what it leaves out.
+        chosen = lambda **options: [self.generate(model, **options)["settings"][name] for name in ("stage", "d1", "d2")]
+        self.assertEqual(chosen(), ["stage2b", 1, 2])
+        self.assertEqual(chosen(loops=4), ["stage1", 2, None])
+        self.assertEqual(chosen(loops=5), ["stage2b", 2, 4])
+        self.assertEqual(chosen(loops=4, stage="stage2b"), ["stage2b", 1, 2])
+        self.assertEqual(chosen(loops=5, stage="stage1", d1=2), ["stage1", 2, None])
+        with self.assertRaisesRegex(ValueError, "d1 < d2 < R"):  # a depth alone is read against the preset, as before
+            self.generate(model, loops=5, d1=2)
         with self.assertRaisesRegex(ValueError, r"d1 < d2 < R \(R = 4\)"):
             self.generate(model, loops=4, stage="stage2b", d1=1, d2=4)
         with self.assertRaisesRegex(ValueError, "variable-loop"):

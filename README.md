@@ -142,6 +142,9 @@ python scripts/benchmark.py --method ar --model inkling-2-mini-varloop --humming
 python scripts/benchmark.py --summarize runs/inkling-varloop-core-2dsd.jsonl runs/inkling-varloop-core-ar.jsonl
 ```
 
+`--loops 4` or `--loops 5` runs the checkpoint with more passes (add `--drafter-of-other-loops`: the drafter is
+trained at R = 3). The schedule defaults to the fastest measured one for each R.
+
 ## Training
 
 See [`training/README.md`](training/README.md) for both recipes:

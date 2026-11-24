@@ -53,7 +53,8 @@ inkling-2-mini-varloop and none for inkling-2-mini yet (pass --drafter or
 --block-size 1). Its EOS ids are fixed to [200006].
 --method ar is the same runner decoding one token at a time; it is not the
 vendor's engine (scripts/inkling2/native_baseline.py measures that one).
---loops R runs a variable-loop checkpoint with R passes. --shard I/N runs every
+--loops R runs a variable-loop checkpoint with R passes, by default on the
+fastest measured schedule of that R. --shard I/N runs every
 N-th prompt of the order, for one process per GPU with its own --out.
 
 Sampling (paper): --temperature 0.6 --top-p 0.95. Every request uses the seed
@@ -356,10 +357,12 @@ def main(argv=None) -> None:
     parser.add_argument("--warmup", type=int, default=2, help="64-token warmup requests")
     parser.add_argument("--stage", choices=("stage1", "stage2a", "stage2b"),
                         help="2DSD variant: stage1 drafts at r1 only, stage2a adds deeper promotion at r2, stage2b "
-                        "also forks at r2 (default: the paper's setting for the model)")
+                        "also forks at r2. Without --stage, --d1 and --d2: the paper's main setting of the "
+                        "family, except Ouro-1.4B (stage1 at r1 = 2, its fastest in the paper's Table 11) and "
+                        "Inkling2 with --loops (the fastest measured schedule of that number of passes)")
     parser.add_argument("--block-size", type=int,
                         help="drafted block size k (default 16, Inkling2 8; 1 runs no drafter)")
-    parser.add_argument("--d1", type=int, help="early readout loop r1 (default 1)")
+    parser.add_argument("--d1", type=int, help="early readout loop r1 (default 1; Inkling2 with --loops: see there)")
     parser.add_argument("--d2", type=int, help="deeper readout loop r2 (default 2 when R = 3 or 4)")
     parser.add_argument("--kv-policy", choices=("w64", "native"),
                         help="Dory: w64 last-loop sharing or native per-loop KV; set by --target for a registry "
@@ -383,7 +386,9 @@ def main(argv=None) -> None:
                              "by default: checkpoints of one architecture take each other's drafters silently)")
     parser.add_argument("--loops", type=int, metavar="R",
                         help="Inkling2 variable-loop checkpoints only: run R passes instead of the checkpoint's "
-                             "own count; the output is then the readout of pass R, another model output")
+                             "own count; the output is then the readout of pass R, another model output. Without "
+                             "--stage, --d1 and --d2 the schedule is the fastest measured one of R: (r1, r2) = "
+                             "(1, 2) for R = 3, r1 = 2 alone for R = 4, (r1, r2) = (2, 4) for R = 5")
     parser.add_argument("--drafter-of-other-loops", action="store_true",
                         help="Inkling2 only, with --loops: draft with a drafter that was trained at another "
                              "number of passes of the same checkpoint (refused by default)")
@@ -442,6 +447,13 @@ def main(argv=None) -> None:
         parser.error("--loops and --drafter-of-other-loops apply to Inkling2 only")
     if args.proposal_top_p is not None and (args.method != "2dsd" or args.temperature <= 0):
         parser.error("--proposal-top-p applies to 2DSD sampling")
+    if args.method == "2dsd" and args.stage is None and args.d1 is None and args.d2 is None:
+        from vllm.v1.spec_decode.twodsd import best_schedule
+
+        # The schedule the engine takes by default where it is not its family's preset (Ouro-1.4B, Inkling2
+        # at another number of passes): named here, so that the run identity records it.
+        for name, value in best_schedule(args.model, args.revision, args.loops).items():
+            setattr(args, name, value)
     if args.humming:
         sys.path.insert(0, str(args.humming))
     args.engine_kwargs = {}

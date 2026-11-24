@@ -99,30 +99,6 @@ def _load_source(
 
 
 @triton.jit
-def _mix(
-    Stack,
-    stride_s,
-    Last,
-    Addend,
-    row_off,
-    offs,
-    mask,
-    probs,
-    n_idx,
-    N_STACK,
-    HAS_ADDEND,
-    BLOCK_D,
-):
-    acc = tl.zeros((BLOCK_D,), tl.float32)
-    for n in tl.static_range(N_STACK + 1):
-        x = _load_source(
-            Stack, stride_s, Last, Addend, row_off, offs, mask, n, N_STACK, HAS_ADDEND
-        )
-        acc = tl.fma(tl.sum(tl.where(n_idx == n, probs, 0.0)), x, acc)
-    return acc
-
-
-@triton.jit
 def _attn_res_row_kernel(
     Stack,
     Last,

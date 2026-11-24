@@ -624,7 +624,7 @@ class NativeInkling2:
         every depth, pass_end the end-of-pass blocks, and release_experts drops each layer's experts from the
         checkpoint after its last use.
         """
-        c, p = self.config, self.precision
+        c = self.config
         core, layers = c.core_layers, c.num_hidden_layers
         passes = c.num_passes if num_passes is None else num_passes
         depths = (passes,) if depths is None else tuple(sorted(set(depths)))

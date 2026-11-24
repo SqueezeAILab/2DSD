@@ -101,6 +101,7 @@ class FakeEngines:
         self.generated, self.constructed, self.model_types, self.eos, self.engine_kwargs = [], [], [], [], []
         self.runtime = {}  # the defaults of twodsd.inkling2_runtime; empty: only what the command line asks
         self.expert_backend = "eager"  # twodsd.inkling2_expert_backend of that runtime
+        self.best, self.schedules = {}, []  # twodsd.best_schedule; the stage and depths each engine was given
         self.proposal_top_p = []
         engines = self
 
@@ -108,6 +109,7 @@ class FakeEngines:
             def __init__(self, model, drafter, **options):
                 engines.constructed.append({"model": model, "drafter": drafter, "revision": options["revision"],
                                             "kv_policy": options["kv_policy"]})
+                engines.schedules.append({name: options.get(name) for name in ("stage", "d1", "d2")})
                 engines.engine_kwargs.append({name: options[name]
                                               for name in ("plain", "experts", "drafter_of_other_target",
                                                            "loops", "drafter_of_other_loops", "runner",
@@ -150,6 +152,7 @@ class FakeEngines:
         twodsd.engine_options = lambda model, revision, kv_policy: {"kv_policy": kv_policy}
         twodsd.inkling2_runtime = lambda chosen: dict(self.runtime, **chosen)
         twodsd.inkling2_expert_backend = lambda runtime: self.expert_backend
+        twodsd.best_schedule = lambda model, revision=None, loops=None: dict(self.best)
         vllm = types.ModuleType("vllm")
         vllm.LLM, vllm.SamplingParams = LLM, lambda **params: SimpleNamespace(**params)
         self.modules = {"vllm": vllm, "vllm.v1.spec_decode.twodsd": twodsd}
@@ -545,6 +548,30 @@ class Inkling2(BenchmarkRun):
         with self.assertRaises(SystemExit):
             self.run_benchmark("--loops", "4", model="ouro-1.4b-thinking", drafter=None, out=self.root / "ouro.jsonl")
         self.assertIn("--loops and --drafter-of-other-loops apply to Inkling2 only", self.stderr.getvalue())
+
+    def test_a_run_without_a_schedule_names_the_engine_s_best_one(self):
+        """Where the engine's default is not its family's preset (Ouro-1.4B, Inkling2 at another number of
+        passes), a run that names no stage and no depth passes that schedule on and records it: such a run
+        and one that names the same schedule are one run, and a results file of the preset is not continued
+        on another schedule. A named stage or depth, and plain decoding, are left as given."""
+        base = dict(model="inkling-2-mini-varloop", drafter="me/drafter@1")
+        self.run_benchmark("--limit", "1", **base)
+        self.assertEqual(self.engines.schedules[-1], {"stage": None, "d1": None, "d2": None})
+        self.engines.best = {"stage": "stage1", "d1": 2}
+        with self.assertRaises(SystemExit):  # the file above is of the preset
+            self.run_benchmark(**base)
+        best = self.root / "best.jsonl"
+        self.run_benchmark("--limit", "1", out=best, **base)
+        self.assertEqual(self.engines.schedules[-1], {"stage": "stage1", "d1": 2, "d2": None})
+        identity = self.lines(best)[0]["run_identity"]
+        self.assertEqual((identity["stage"], identity["d1"], identity["d2"]), ("stage1", 2, None))
+        self.run_benchmark("--stage", "stage1", "--d1", "2", out=best, **base)  # the same run: it resumes
+        named = self.root / "named.jsonl"
+        self.run_benchmark("--stage", "stage2b", "--limit", "1", out=named, **base)
+        self.assertEqual(self.engines.schedules[-1], {"stage": "stage2b", "d1": None, "d2": None})
+        plain = self.root / "plain.jsonl"
+        self.run_benchmark("--limit", "1", method="ar", out=plain, **base)
+        self.assertIsNone(self.lines(plain)[0]["run_identity"]["stage"])
 
     def test_the_drafter_kind_chooses_a_registry_drafter(self):
         """--drafter-kind dflash is the default drafter of a registry name; dspark has none published yet,

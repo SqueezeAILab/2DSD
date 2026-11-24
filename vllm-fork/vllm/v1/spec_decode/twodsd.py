@@ -17,7 +17,9 @@ Example::
 
 Method presets (paper Sec. 5.1; Nanbeige: App. E.1): ``2dsd`` is Stage 2b with (r1, r2) = (1, 2)
 and block size 16 on R=4 targets (Ouro, Dory), and Stage 1 with r1 = 1 on R=2
-targets (Nanbeige).
+targets (Nanbeige). A run that names no stage and no depth takes the preset,
+except where another schedule is measured faster (``best_schedule``:
+Ouro-1.4B-Thinking drafts at r1 = 2 without deeper branching, paper Table 11).
 
 Dory1.0-4B shares without adaptation: its pinned checkpoint runs with R = 4
 loops (an inference override of the checkpoint default of 2) and, by default,
@@ -37,7 +39,9 @@ runner (``inkling2_runtime``: on a GPU the static runner with CUDA graphs;
 ``runner="batched"`` and ``runner="reference"`` select the eager paths that it is
 checked against). Its preset
 is Stage 2b with (r1, r2) = (1, 2), the only Stage 2 schedule at R = 3, and block
-size ``INKLING2_BLOCK_SIZE``; its EOS ids are fixed to
+size ``INKLING2_BLOCK_SIZE``; a variable-loop checkpoint run with another number
+of passes (``loops``) takes the schedule of ``inkling2_preset`` unless a stage or
+a depth is given. Its EOS ids are fixed to
 ``INKLING2_EOS_TOKEN_IDS``. The block size and the EOS id are
 ``mtp_config.block_size`` and ``eos_token_id`` of the checkpoint's config.json
 (thinkingmachines/Inkling-2-Mini at revision 1fb4134b). It keeps per-loop KV:
@@ -97,15 +101,20 @@ def check_model_type(model_type: str | None) -> None:
         )
 
 
-def model_type(model: str, revision: str | None = None) -> str | None:
-    """``model_type`` of a local checkpoint or a Hugging Face repository (None if
-    its config.json declares none)."""
+def _config(model: str, revision: str | None = None) -> dict[str, Any]:
+    """config.json of a local checkpoint or a Hugging Face repository."""
     path = Path(model) / "config.json"
     if not path.is_file():
         from huggingface_hub import hf_hub_download
 
         path = Path(hf_hub_download(model, "config.json", revision=revision))
-    return json.loads(path.read_text()).get("model_type")
+    return json.loads(path.read_text())
+
+
+def model_type(model: str, revision: str | None = None) -> str | None:
+    """``model_type`` of a local checkpoint or a Hugging Face repository (None if
+    its config.json declares none)."""
+    return _config(model, revision).get("model_type")
 
 
 def engine_options(model: str, revision: str | None, kv_policy) -> dict[str, Any]:
@@ -402,7 +411,8 @@ def preset(model_type: str, method: str = "2dsd") -> dict[str, Any]:
     """Paper settings for ``method`` on an Ouro or Dory (R=4) or Nanbeige (R=2) target.
 
     Inkling2 (R=3) takes the same Stage 2b schedule, (1, 2), with block size
-    ``INKLING2_BLOCK_SIZE``.
+    ``INKLING2_BLOCK_SIZE``; ``inkling2_preset`` is its default at another
+    number of passes.
 
     Raises:
         ValueError: If ``method`` or ``model_type`` is unknown.
@@ -414,6 +424,59 @@ def preset(model_type: str, method: str = "2dsd") -> dict[str, Any]:
         return {"stage": "stage1", "k": 16, "d1": 1}
     k = INKLING2_BLOCK_SIZE if model_type == INKLING2 else 16
     return {"stage": "stage2b", "k": k, "d1": 1, "d2": 2}
+
+
+def inkling2_preset(loops: int) -> dict[str, Any]:
+    """Default schedule of an Inkling2 target that runs ``loops`` passes.
+
+    The fastest schedule of the full evaluation on the variable-loop checkpoint:
+    the Stage 2b preset at (r1, r2) = (1, 2) for R = 3, Stage 1 at r1 = 2 for
+    R = 4, and Stage 2b at (2, 4) for R = 5 (which the evaluation cannot tell
+    from Stage 1 at r1 = 3). Any other R takes Stage 1 at r1 = ceil(R / 2), the
+    rule of R = 4, which is not measured there.
+    """
+    settings = preset(INKLING2)
+    if loops == 5:
+        settings.update(d1=2, d2=4)
+    elif loops != 3:
+        settings.update(stage="stage1", d1=(loops + 1) // 2)  # d2 stays: Stage 1 does not read it
+    return settings
+
+
+OURO_1_4B_LAYERS = 24  # Ouro-1.4B-Thinking; Ouro-2.6B-Thinking has 48
+
+
+def best_schedule(
+    model: str, revision: str | None = None, loops: int | None = None
+) -> dict[str, Any]:
+    """What a run that names no stage and no depth changes in its family's preset.
+
+    The preset is the paper's main setting (Sec. 5.1). Two targets are measured
+    faster on another schedule, which is their default:
+
+    - Ouro-1.4B-Thinking: Stage 1 at r1 = 2 (paper Table 11: 5.37x over native AR
+      against the preset's 4.83x under greedy decoding, 4.44x against 3.91x
+      under sampling). Ouro-2.6B-Thinking and Dory1.0-4B are fastest on the
+      preset.
+    - Inkling2 with ``loops`` other than three passes: ``inkling2_preset``.
+
+    Returns the schedule as a run would name it (``stage``, ``d1`` and, for a
+    Stage 2 variant, ``d2``), empty for every other run.
+    """
+    config = _config(model, revision)
+    family = config.get("model_type")
+    check_model_type(family)
+    if family == INKLING2:
+        from vllm.model_executor.models.looped_kv import loop_count
+
+        chosen = inkling2_preset(loops or loop_count(config))
+        if chosen == preset(INKLING2):
+            return {}
+        names = ("stage", "d1") if chosen["stage"] == "stage1" else ("stage", "d1", "d2")
+        return {name: chosen[name] for name in names}
+    if family == "ouro" and config.get("num_hidden_layers") == OURO_1_4B_LAYERS:
+        return {"stage": "stage1", "d1": 2}
+    return {}
 
 
 class TwoDSD:
@@ -524,6 +587,8 @@ class TwoDSD:
         hf_config = self.llm.llm_engine.model_config.hf_config
         self.model_type = hf_config.model_type
         settings = preset(self.model_type)
+        if stage is None and d1 is None and d2 is None:
+            settings.update(best_schedule(model, revision))
         for name, value in (("stage", stage), ("k", block_size), ("d1", d1), ("d2", d2)):
             if value is not None:
                 settings[name] = value
@@ -564,8 +629,6 @@ class TwoDSD:
         import torch
         from transformers import AutoTokenizer
 
-        from vllm.model_executor.models.inkling2_reference import NativeInkling2
-
         known = {"device", "precision", "dtype", "experts", "plain", "runner", "drafter_cuda_graph",
                  "draft_confidence", "tensor_cores", "frozen_suffix", "draft_vocab",
                  "drafter_of_other_target", "loops", "drafter_of_other_loops"}
@@ -575,17 +638,12 @@ class TwoDSD:
                 f"{sorted(set(engine_kwargs) - known)}"
             )
         window = inkling2_kv_window(kv_policy)
-        settings = preset(INKLING2)
-        settings.update({name: v for name, v in schedule.items() if v is not None})
+        chosen = {name: v for name, v in schedule.items() if v is not None}
         plain = bool(engine_kwargs.get("plain"))
         if plain:
-            settings.update(stage="stage1", k=1)
             drafter = None
-        if settings["k"] > 1 and drafter is None:
+        elif chosen.get("k", INKLING2_BLOCK_SIZE) > 1 and drafter is None:
             raise ValueError("A drafter export is required for block_size > 1")
-        # The executor's own checks, before a checkpoint of tens of GiB loads.
-        if not engine_kwargs.get("frozen_suffix", True) and settings["stage"] != "stage1":
-            raise ValueError("Only greedy Stage 1 can drop the suffix its review rejects")
         confidence = engine_kwargs.get("draft_confidence")
         if confidence is not None and not 0 <= float(confidence) <= 1:
             raise ValueError("draft_confidence is a probability")
@@ -593,6 +651,21 @@ class TwoDSD:
             from huggingface_hub import snapshot_download
 
             model = snapshot_download(model, revision=revision)
+        # A run that names no stage and no depth takes the schedule of the number of
+        # passes it runs; a named stage or depth keeps the Stage 2b (1, 2) preset
+        # for what it leaves out, as before.
+        from vllm.model_executor.models.looped_kv import loop_count
+
+        passes = engine_kwargs.get("loops") or loop_count(
+            json.loads((Path(model) / "config.json").read_text())
+        )
+        named = any(name in chosen for name in ("stage", "d1", "d2"))
+        settings = {**(preset(INKLING2) if named else inkling2_preset(passes)), **chosen}
+        if plain:
+            settings.update(stage="stage1", k=1)
+        # The executor's own check, before a checkpoint of tens of GiB loads.
+        if not engine_kwargs.get("frozen_suffix", True) and settings["stage"] != "stage1":
+            raise ValueError("Only greedy Stage 1 can drop the suffix its review rejects")
         if drafter is not None and not Path(drafter).is_dir():
             from huggingface_hub import snapshot_download
 
@@ -610,8 +683,10 @@ class TwoDSD:
 
             warnings.warn(slow, stacklevel=2)
         if runtime["tensor_cores"]:
-            from vllm.model_executor.models.inkling2_fast import FastInkling2 as NativeInkling2
-        native = NativeInkling2.from_pretrained(
+            from vllm.model_executor.models.inkling2_fast import FastInkling2 as Model
+        else:
+            from vllm.model_executor.models.inkling2_reference import NativeInkling2 as Model
+        native = Model.from_pretrained(
             model,
             device=engine_kwargs.get("device", "cuda"),
             precision=engine_kwargs.get("precision", "served"),

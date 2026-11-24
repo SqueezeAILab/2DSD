@@ -539,7 +539,7 @@ class Inkling2GraphRunner(Inkling2BatchRunner):
         self.core_partial[r.plane, r.slot] = partial
 
     def _coda(self, r, capacity):
-        model, depth = self.model, r.extra  # the pass the readout follows, counted from 0
+        depth = r.extra  # the pass the readout follows, counted from 0
         blocks = [*self.pre_blocks[r.slot].unbind(1), *self.core_blocks[depth, r.slot].unbind(1)]
         partial = self.core_partial[depth, r.slot]
         coda = {}
@@ -775,7 +775,7 @@ class Inkling2GraphRunner(Inkling2BatchRunner):
         )
         from vllm.triton_utils import tl
 
-        c, p, weight = self.config, self.model.precision, self.model._lw
+        c, weight = self.config, self.model._lw
         rows, top = y.shape[0], c.num_experts_per_tok
         ids, weights = ops.router_rows(y, self._half(layer, "mlp.gate.weight"), weight(layer, "mlp.gate.bias"),
                                        top, c.route_scale, padding)
@@ -841,7 +841,7 @@ class Inkling2GraphRunner(Inkling2BatchRunner):
                     inputs.append(model._norm(torch.where(r.later[:, None], blend, mix),
                                               norms[0 if local else s]))
         x_q, x_k, x_v = inputs if len(inputs) == 3 else inputs * 3
-        heads, kv_heads, dim = self.heads, self.kv_heads, self.head_dim
+        heads, dim = self.heads, self.head_dim
         count = x_q.shape[0]
         tau = None
         if not local and c.log_scaling_n_floor is not None:
