@@ -11,6 +11,10 @@ every document is replayed exactly with training.sharekv.exact_documents.
 Dory (DoryTarget) is block-wise looped and has no Transformers port: its features come from the native
 PyTorch model in training.hf_models.dory, whose loop-d state is already the output block's readout state.
 
+Inkling 2 (Inkling2Target) restarts every pass from its prelude and has no residual stream: its features
+come from the reference forward (vllm.model_executor.models.inkling2_reference), one run for every depth,
+and are the vectors its tree runner hands the drafter at run time.
+
 A feature is the output of 0-based layer l inside loop r (pre-final-norm residual stream). The
 loop-r readout is lm_head(norm(output of layer L-1 in loop r)), the model's own per-loop hidden state;
 that loop output is captured separately for labels and native readouts, not fed to the drafter.
@@ -32,10 +36,22 @@ def default_feature_layers(num_layers):
     return [round(1 + j * (num_layers - 4) / 4) for j in range(5)]
 
 
+def inkling2_feature_layers(text_config):
+    """Feature layers of an Inkling 2 text config: DFlash's rule along one depth's path
+    (vllm.model_executor.models.inkling2_reference.drafter_feature_layers: on Mini the inputs of layers 2,
+    7, 12, 17 and 22)."""
+    from vllm.model_executor.models.inkling2_reference import drafter_feature_layers
+
+    return drafter_feature_layers(text_config["num_hidden_layers"])
+
+
 def target_feature_layers(config):
-    """Default feature layers of a target config.json: Dory's physical taps, otherwise the DFlash rule."""
+    """Default feature layers of a target config.json: Dory's physical taps, Inkling 2's taps, otherwise the
+    DFlash rule."""
     if config.get("model_type") == "dory":
         return list(DORY_FEATURE_LAYERS)
+    if config.get("model_type") == registry.FAMILY_MODEL_TYPES["inkling2"]:
+        return inkling2_feature_layers(config["text_config"])
     return default_feature_layers(config["num_hidden_layers"])
 
 
@@ -207,18 +223,146 @@ class DoryTarget:
         return torch.cat([self.readout_logits(h).argmax(-1) for h in state.split(chunk)])
 
 
-def native_target(name, feat_layers, device, dtype=torch.bfloat16, path=None, attention="flash"):
+class _Inkling2Embedding:
+    """The normed token embedding that starts Inkling 2's prelude, as a callable with a `weight` whose rows
+    are the normed embeddings (the mask vector is initialised from one of them)."""
+
+    def __init__(self, model):
+        self._model = model
+        self.weight = self
+
+    def __call__(self, token_ids):
+        model = self._model
+        table = model.checkpoint.tensors[_inkling2_names().EMBED_NAME]  # with its padding rows
+        return model._norm(table[token_ids].to(model.precision.dtype), model._w("embed_norm.weight"))
+
+    def __getitem__(self, token_ids):
+        return self(torch.as_tensor(token_ids, device=self._model.device))
+
+
+class _Inkling2Head:
+    """Inkling 2's unembedding over the served vocabulary, before the logit softcap."""
+
+    def __init__(self, model):
+        self.weight = model.checkpoint.unembedding  # [served vocabulary, H], BF16
+        self.softcap = model.config.final_logit_softcapping
+
+    def __call__(self, hidden):
+        return torch.nn.functional.linear(hidden, self.weight.to(hidden.dtype))
+
+
+def _inkling2_names():
+    from vllm.model_executor.models import inkling2_weights
+
+    return inkling2_weights
+
+
+class Inkling2Target:
+    """Frozen looped Inkling 2 (per-pass KV, R passes) by teacher forcing with the reference forward.
+
+    One forward gives every depth: the depth-d readout is the coda on the state after pass d with keys,
+    values and conv states of its own. The depth-d features of a position are the inputs of the feature
+    layers: a prelude layer once, a core layer in pass d, a coda layer in the coda on pass d's state (as
+    Dory's taps lie in its input block, in loop d of its recurrent block and in its output block on s_d).
+    The default layers follow DFlash's rule along one depth's path. num_hidden_layers at the end of
+    feat_layers adds the depth's final-norm state, the readout state, which the default does not feed. They
+    are the vectors and the order of the tree runner (vllm.model_executor.models.inkling2_2d), so the
+    drafter reads at run time what it was trained on. Labels are the argmax over the served vocabulary.
+
+    experts "packed" keeps the experts quantized on the device (a 48 GB card cannot hold them dense);
+    the forward then dequantizes each routed expert by the runner's table lookup. tensor_cores runs the
+    forward as FastInkling2 (the served arithmetic with its products on tensor cores, the grouped expert GEMM
+    and the attention kernel): about four times faster on an H100 and equally close to the served tokens. The
+    head returns logits before the softcap (target.lm_head.softcap); the trainer applies it after the
+    drafter's own logit terms.
+    """
+
+    family = "inkling2"
+
+    def __init__(self, path, feat_layers, device, dtype=torch.bfloat16, experts="dense", precision="served",
+                 tensor_cores=False):
+        from vllm.model_executor.models.inkling2_fast import FastInkling2
+        from vllm.model_executor.models.inkling2_reference import NativeInkling2
+
+        model = FastInkling2 if tensor_cores else NativeInkling2
+        self._bind(model.from_pretrained(path, device=device, precision=precision, dtype=dtype, experts=experts),
+                   feat_layers)
+
+    @classmethod
+    def from_model(cls, model, feat_layers=None):
+        target = cls.__new__(cls)
+        target._bind(model, feat_layers)
+        return target
+
+    def _bind(self, model, feat_layers):
+        from vllm.model_executor.models.inkling2_batch import ExpertBank
+
+        c = model.config
+        self.model = model
+        ExpertBank.of(model, (2 << 30) if model.device.type == "cuda" else None)
+        self.L, self.R, self.H = c.num_hidden_layers, c.num_passes, c.hidden_size
+        from vllm.model_executor.models.inkling2_reference import drafter_feature_layers
+
+        self.feat_layers = drafter_feature_layers(self.L) if feat_layers is None else list(feat_layers)
+        taps = self.feat_layers[:-1] if self.feat_layers and self.feat_layers[-1] == self.L else self.feat_layers
+        if not self.feat_layers or len(set(taps)) != len(taps) or any(not 0 <= layer < self.L for layer in taps):
+            raise ValueError(f"Inkling 2 feature layers are distinct layers below {self.L}, optionally followed "
+                             f"by {self.L} (the final-norm state)")
+        self.embed = _Inkling2Embedding(model)
+        self.lm_head = _Inkling2Head(model)
+
+    @torch.no_grad()
+    def features(self, input_ids):
+        """Document [T] -> features [R, T, F], final-norm states [R, T, H] of every depth."""
+        core = self.model.config.core_layers
+        final = self.feat_layers[-1] == self.L
+        taps = self.feat_layers[:-1] if final else self.feat_layers
+        depths = range(1, self.R + 1)
+        visit = {(layer, depth): layer if layer < core.start else layer + (depth - 1) * len(core)
+                 for layer in taps if layer < core.stop for depth in depths}
+        out = self.model.forward(input_ids, num_passes=self.R, depths=tuple(depths), taps=set(visit.values()),
+                                 pass_end=False, coda_taps=[layer for layer in taps if layer >= core.stop])
+        states = torch.stack([out.readouts[depth].hidden for depth in depths])
+
+        def tap(layer, depth):  # a coda layer's input is that of the coda on the depth's own state
+            return out.features[visit[layer, depth]] if layer < core.stop else out.readouts[depth].taps[layer]
+
+        # Written tap by tap into one tensor: a concatenation per depth and a stack over depths would each hold
+        # another copy of every tap (2 GiB apiece for a 16K-token document).
+        feats = states.new_empty(self.R, states.shape[1], len(self.feat_layers) * self.H)
+        for depth in depths:
+            columns = [*(tap(layer, depth) for layer in taps), *([out.readouts[depth].hidden] if final else [])]
+            for j, column in enumerate(columns):
+                feats[depth - 1, :, j * self.H:(j + 1) * self.H] = column
+        return feats, states
+
+    @torch.no_grad()
+    def readout_logits(self, state):
+        return self.model.readout_logits(state)
+
+    @torch.no_grad()
+    def readout_argmax(self, state):
+        """state [N, H] (a depth's final-norm state) -> argmax of that depth's readout [N]."""
+        return self.model.readout_argmax(state)
+
+
+def native_target(name, feat_layers, device, dtype=torch.bfloat16, path=None, attention="flash", experts="dense",
+                  tensor_cores=False):
     """Native target of registry model `name`, loaded from path (default: its pinned original).
 
     attention selects the attention of Dory's teacher-forced forward (DoryTarget); the Transformers
-    ports always use SDPA.
+    ports always use SDPA. experts ("dense" or "packed") and tensor_cores are Inkling 2's.
     """
     family = registry.family(name)
     path = path or registry.resolve(name)
     if family == "dory":
         return DoryTarget(path, feat_layers, device, dtype, attention)
-    cls = {"nanbeige": NanbeigeTarget}.get(family, OuroTarget)
-    return cls(path, feat_layers, device, dtype)
+    if family == "inkling2":
+        return Inkling2Target(path, feat_layers, device, dtype, experts, tensor_cores=tensor_cores)
+    targets = {"ouro": OuroTarget, "nanbeige": NanbeigeTarget}
+    if family not in targets:
+        raise NotImplementedError(f"No drafter-training target for family {family!r} yet")
+    return targets[family](path, feat_layers, device, dtype)
 
 
 class ReplayTarget:

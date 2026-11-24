@@ -1,0 +1,28 @@
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -2596,6 +2596,25 @@
+     k_scale: torch.Tensor,
+     v_scale: torch.Tensor,
+ ) -> None:
++    if key.is_cuda and current_platform.is_device_capability_family(90):
++        # Pod patch: this image's _C_cache_ops ships this kernel for SM10x only (no sm_90
++        # SASS or PTX), and its launch error is not checked. Hopper takes vLLM's Triton
++        # kernel of the same contract.
++        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
++            triton_reshape_and_cache_flash,
++        )
++
++        triton_reshape_and_cache_flash(
++            key,
++            value,
++            key_cache,
++            value_cache,
++            slot_mapping,
++            kv_cache_dtype,
++            k_scale,
++            v_scale,
++        )
++        return
+     torch.ops._C_cache_ops.reshape_and_cache_flash(
+         key,
+         value,

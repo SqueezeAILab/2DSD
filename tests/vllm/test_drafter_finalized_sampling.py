@@ -8,12 +8,13 @@ temperature and top-p the law is the tempered loop-R chain cut to its nucleus.
 """
 
 import collections
+import itertools
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
-from helpers import FakeTreeRunner, cuda_test
+from helpers import FakeTreeRunner, FusedReadoutRunner, NodeStateRunner, cuda_test
 from scipy.stats import chi2, kstest
 from vllm.v1.spec_decode.looped_2d_finalized import FinalizedTreeExecutor
 
@@ -27,8 +28,18 @@ class Chain:
     draft: torch.Tensor  # argmax drafter's next token given the current token
 
     @property
+    def loops(self):
+        return max(self.readouts)
+
+    @property
     def final(self):
-        return self.readouts[4]
+        return self.readouts[self.loops]
+
+
+def readouts(loops, shallow, middle, late, final):
+    """Loop 1, loop 2, every later loop below the last, and the last loop."""
+    early = (shallow, middle) + (late,) * (loops - 3)
+    return {d: early[d - 1] for d in range(1, loops)} | {loops: final}
 
 
 def dirichlet(alpha, generator):
@@ -36,7 +47,7 @@ def dirichlet(alpha, generator):
     return sample / sample.sum(-1, keepdim=True)
 
 
-def mixed_chain():
+def mixed_chain(loops=4):
     """Loop 1 mixes in an unrelated chain; loop 2 adds its own error, so a d2 fork
     is not exactly the residual p_R ⊖ p_d1. The drafter is right for odd tokens."""
     g = torch.Generator().manual_seed(20261030)
@@ -45,24 +56,39 @@ def mixed_chain():
     middle = 0.4 * shallow + 0.4 * final + 0.2 * dirichlet(1.0, g)
     mode = final.argmax(-1)
     draft = torch.where(torch.arange(V) % 2 == 1, mode, (mode + 1) % V)
-    return Chain({1: shallow, 2: middle, 3: 0.2 * shallow + 0.8 * final, 4: final}, draft)
+    return Chain(readouts(loops, shallow, middle, 0.2 * shallow + 0.8 * final, final), draft)
 
 
-def promotion_chain():
+def promotion_chain(loops=4):
     """Loop 1 is mostly wrong and loop 2 nearly final, with an always-final drafter:
     d1 rejects often and d2 promotes often."""
     g = torch.Generator().manual_seed(7)
     final = dirichlet(0.5, g)
     shallow = 0.2 * final + 0.8 * dirichlet(0.5, g)
-    readouts = {1: shallow, 2: 0.85 * final + 0.15 * shallow,
-                3: 0.95 * final + 0.05 * shallow, 4: final}
-    return Chain(readouts, final.argmax(-1))
+    laws = readouts(loops, shallow, 0.85 * final + 0.15 * shallow,
+                    0.95 * final + 0.05 * shallow, final)
+    return Chain(laws, final.argmax(-1))
+
+
+def cycle_chain(loops=4):
+    """The drafter follows the cycle t -> t + 1, the mode of the last loop. Loop 1
+    underrates that step after even tokens, so d1 freezes the drafts and the nearly
+    final loop 2 promotes them, and overrates it after odd tokens, so the token
+    after a promoted head passes the re-review with p_d1 far above the final law:
+    the law holds only if its proposal becomes p_d2."""
+    step = torch.roll(torch.eye(V), 1, 1)
+    uniform = torch.full((V, V), 1 / V)
+    final = 0.5 * step + 0.5 * uniform
+    weight = torch.where(torch.arange(V) % 2 == 0, 0.05, 0.9)[:, None]
+    shallow = weight * step + (1 - weight) * uniform
+    middle = 0.9 * final + 0.1 * shallow
+    return Chain(readouts(loops, shallow, middle, middle, final), final.argmax(-1))
 
 
 class MarkovRunner(FakeTreeRunner):
     def __init__(self, chain):
         self.chain = chain
-        super().__init__(8, causal=False)
+        super().__init__(8, causal=False, loops=chain.loops)
 
     def reset(self):
         super().reset()
@@ -76,7 +102,7 @@ class MarkovRunner(FakeTreeRunner):
 
     def prefill(self, tokens):
         result = super().prefill(tokens)
-        result.hidden = tokens.to(self.dtype).reshape(-1, 1) + 4000
+        result.hidden = tokens.to(self.dtype).reshape(-1, 1) + 1000 * self.R
         result.features = result.hidden.clone()
         return result
 
@@ -134,11 +160,17 @@ def nucleus_law(law, temperature, top_p):
 
 
 def run(chain, stage, k, d1=1, runs=4000, length=4, patch=None, stage2_gate="argmax",
-        temperature=1.0, top_p=1.0, proposal_top_p=None):
+        temperature=1.0, top_p=1.0, proposal_top_p=None, protocol=None, tight=False, nucleus_width=None,
+        prefetch=False, d2=2):
+    runner = MarkovRunner(chain)
+    if tight:  # the request ends at the last context position
+        runner.max_len = 2 + length
+    if protocol is not None:  # fused readouts, with or without node state
+        runner = protocol.for_schedule(runner, stage, d1)
     executor = FinalizedTreeExecutor(
-        MarkovRunner(chain), MarkovDraft(chain) if k > 1 else None, k, stage, d1=d1,
+        runner, MarkovDraft(chain) if k > 1 else None, k, stage, d1=d1, d2=d2,
         temperature=temperature, stage2_gate=stage2_gate, top_p=top_p,
-        proposal_top_p=proposal_top_p,
+        proposal_top_p=proposal_top_p, nucleus_width=nucleus_width, prefetch=prefetch,
     )
     if patch:
         patch(executor)
@@ -149,6 +181,8 @@ def run(chain, stage, k, d1=1, runs=4000, length=4, patch=None, stage2_gate="arg
         stats = result["stats"]
         for name in ("promotions", "forks", "bonus_tokens", "frozen_created"):
             totals[name] += stats[name]
+        for name in ("nucleus_calls", "nucleus_sorts"):
+            totals[name] += stats.get(name, 0)
         totals["frozen_commits"] += stats["commit_sources"]["frozen"]
     return outputs, totals
 
@@ -272,6 +306,61 @@ class FinalizedSamplingTests(unittest.TestCase):
                     if stage == "stage2b":
                         self.assertGreater(totals["promotions"] + totals["forks"], 0)
 
+    def test_a_nucleus_read_from_the_most_probable_tokens_is_the_sorted_one(self):
+        """nucleus_width reads the top-p cut of a target row from its most probable tokens. On rows whose
+        two most probable tokens hold top_p the distribution is the sort's (same support, same values up
+        to rounding), shallow rows keep every token, and a call with a row that needs a third token falls
+        back to the sort, bit for bit. Commits then follow the cut loop-R chain as with the sort."""
+        runner = MarkovRunner(mixed_chain())
+        generator = torch.Generator().manual_seed(0)
+        peaked = torch.randn(6, V, generator=generator)
+        peaked[torch.arange(6), torch.randint(V, (6,), generator=generator)] += 4.0
+        flat = torch.cat((peaked[:5], torch.zeros(1, V)))
+        for proposal in (1.0, None):  # proposals uncut, and cut like the target (every row of a call then)
+            sort, top = (FinalizedTreeExecutor(runner, None, 1, "stage1", d1=1, temperature=0.6, top_p=0.8,
+                                               proposal_top_p=proposal, nucleus_width=width) for width in (None, 2))
+            for logits, fast in ((peaked, True), (flat, False)):
+                # Every row a target, proposals among them, and a call of proposals only.
+                for depths in ([4] * 6, [1, 4, 1, 4, 4, 4], [1] * 6):
+                    with self.subTest(proposal=proposal, fast=fast, depths=depths):
+                        want, got = sort._readout_distributions(logits.clone(), depths), \
+                            top._readout_distributions(logits.clone(), depths)
+                        cut = [d == 4 or proposal is None for d in depths]
+                        if fast:
+                            self.assertTrue(torch.equal(want > 0, got > 0))
+                            self.assertTrue(torch.allclose(want, got, atol=1e-6))
+                            self.assertTrue(all(int((row > 0).sum()) <= 2 for row, c in zip(got, cut) if c))
+                        else:
+                            self.assertTrue(torch.equal(want, got))
+                        self.assertTrue(all(int((row == 0).sum()) == 0 for row, c in zip(got, cut) if not c))
+        chain = mixed_chain()
+        law = nucleus_law(chain.final, 0.6, 0.8)
+        self.assertEqual(sorted(set((law > 0).sum(-1).tolist())), [1, 2, 3])
+        # Three tokens hold every row's cut; with two, plain decoding (a row per call) takes both paths.
+        for stage, k, d1, width, proposal in (("stage1", 4, 1, 3, 1.0), ("stage2b", 4, 1, 3, 1.0), ("stage1", 4, 4, 3, 1.0),
+                                              ("stage1", 1, 4, 2, 1.0), ("stage2b", 4, 1, 3, None)):
+            with self.subTest(stage=stage, k=k, d1=d1, width=width, proposal=proposal):
+                paths = collections.Counter()
+
+                def patch(executor):
+                    original = executor._nucleus
+
+                    def counted(probs, rows):
+                        done = original(probs, rows)
+                        paths[done] += 1
+                        return done
+
+                    executor._nucleus = counted
+
+                outputs, totals = run(chain, stage, k, d1=d1, temperature=0.6, top_p=0.8, proposal_top_p=proposal,
+                                      nucleus_width=width, patch=patch)
+                # A request reports its calls with a cut and those that went to the sort.
+                self.assertEqual((totals["nucleus_calls"], totals["nucleus_sorts"]), (sum(paths.values()), paths[False]))
+                self.assert_lossless_against(chain, outputs, law)
+                self.assertGreater(paths[True], 0)
+                if proposal == 1.0:  # a cut proposal row of loop 1 or 2 can need a fourth token
+                    self.assertEqual(paths[False] > 0, width == 2)
+
     def test_top_p_requires_sampling(self):
         chain = mixed_chain()
         for temperature, top_p, proposal in ((0.0, 0.95, None), (1.0, 0.0, None), (1.0, 1.5, None),
@@ -331,6 +420,273 @@ class FinalizedSamplingTests(unittest.TestCase):
         second, _ = run(chain, "stage2b", 4, runs=20)
         self.assertEqual(first, second)
         self.assertGreater(len(set(first)), 1)
+
+
+class ThreeLoopSamplingTests(unittest.TestCase):
+    """The same law at R = 3, the loop count of Inkling2: Stage 1 reviews at
+    d1 = 1, 2 or 3 and Stage 2 has the single schedule (d1, d2) = (1, 2), whose
+    promotions and forks are verified one call later.
+
+    Each check draws half the runs of its R = 4 twin; the wrong-proposal test
+    shows that this still exposes a broken rule. The cycle chain draws twice
+    RUNS: a wrong proposal after a promotion re-review shifts the law the
+    least (with these seeds p is 5e-5 at RUNS draws and 3e-17 at twice as many).
+    """
+
+    RUNS = 2000
+    SCHEDULES = (
+        ("stage1", 1), ("stage1", 2), ("stage1", 3), ("stage2a", 1), ("stage2b", 1),
+    )
+
+    def sample(self, chain, stage, k, runs=RUNS, **options):
+        return run(chain, stage, k, runs=runs, **options)
+
+    def assert_lossless(self, chain, outputs, law=None):
+        self.assertGreater(min(pvalues(chain, outputs, law)), 1e-3)
+
+    def test_every_schedule_and_block_matches_the_loop_3_chain(self):
+        """Commits follow the loop-3 chain for every review depth, with block
+        drafting (k = 4) and without (k = 1, LoopSpec). d1 = 3 is the 1D
+        boundary: the final review is the only one and nothing is frozen."""
+        chain = mixed_chain(3)
+        for (stage, d1), k in itertools.product(self.SCHEDULES, (1, 4)):
+            if k == 1 and (stage, d1) in (("stage1", 3), ("stage2a", 1)):
+                continue  # plain AR, and Stage 1 again: no draft, no frozen suffix
+            with self.subTest(stage=stage, d1=d1, k=k):
+                outputs, totals = self.sample(chain, stage, k, d1=d1)
+                self.assert_lossless(chain, outputs)
+                self.assertGreater(totals["bonus_tokens"], 0)
+                reviewed = k > 1 and d1 < 3
+                self.assertEqual(totals["frozen_created"] > 0, reviewed)
+                self.assertEqual(totals["frozen_commits"] > 0, reviewed)
+                self.assertEqual(totals["promotions"] > 0, stage != "stage1" and k > 1)
+                self.assertEqual(totals["forks"] > 0, stage == "stage2b")
+
+    def test_prefetched_reviews_match_the_loop_3_chain(self):
+        """prefetch reads, with a call's readout, the probabilities its reviews test and a drawn anchor
+        per row below loop 3. Commits still follow the loop-3 chain: for every schedule, with the runner
+        protocols, with top-p from the most probable tokens (proposals uncut and cut), and where most
+        frozen heads are promoted. Stage 1 then never goes back to the GPU for a probability or an
+        anchor; Stage 2 draws the anchors its readouts could not prepare (a row with two children)."""
+        mixed, promotion = mixed_chain(3), promotion_chain(3)
+        cut = dict(temperature=0.6, top_p=0.8, nucleus_width=3)
+        cases = [(mixed, stage, d1, 4, {}) for stage, d1 in self.SCHEDULES]
+        cases += [(mixed, "stage2b", 1, 1, {}), (promotion, "stage2b", 1, 4, {}),
+                  (mixed, "stage1", 1, 4, dict(protocol=NodeStateRunner)),
+                  (mixed, "stage2b", 1, 4, dict(protocol=FusedReadoutRunner)),
+                  (mixed, "stage1", 1, 4, dict(cut, proposal_top_p=1.0)),
+                  (mixed, "stage2b", 1, 4, dict(cut, proposal_top_p=1.0)),
+                  (mixed, "stage2b", 1, 4, dict(cut)), (promotion, "stage2b", 1, 4, dict(cut))]
+        for chain, stage, d1, k, options in cases:
+            with self.subTest(stage=stage, d1=d1, k=k, options=sorted(options), promotion=chain is promotion):
+                reads = collections.Counter()
+
+                def patch(executor):
+                    for name in ("_gather", "_draw_anchors", "_sample_anchors"):
+                        def counted(*args, _original=getattr(executor, name), _name=name):
+                            reads[_name] += 1
+                            return _original(*args)
+                        setattr(executor, name, counted)
+
+                outputs, totals = self.sample(chain, stage, k, d1=d1, prefetch=True, patch=patch, **options)
+                law = nucleus_law(chain.final, 0.6, 0.8) if "top_p" in options else None
+                self.assert_lossless(chain, outputs, law)
+                if chain is mixed:  # the promotion chain's cut proposals are nearly the target: none rejected
+                    self.assertGreater(totals["bonus_tokens"], 0)
+                if d1 < 3 and k > 1:
+                    self.assertGreater(totals["frozen_commits"], 0)
+                    self.assertGreater(reads["_sample_anchors"], 0)
+                if stage == "stage1":
+                    self.assertEqual((reads["_gather"], reads["_draw_anchors"]), (0, 0))
+                else:
+                    self.assertLess(reads["_draw_anchors"], reads["_sample_anchors"])
+                if stage == "stage2b":
+                    self.assertGreater(totals["promotions"] + totals["forks"], 0)
+
+    def test_frequent_promotion_matches_the_loop_3_chain(self):
+        """Loop 2 is nearly final, so most frozen heads are promoted at d2 = 2
+        and they and their re-reviewed suffix are verified in the next call."""
+        cases = (
+            ("promotion", promotion_chain(3), self.RUNS),
+            ("cycle", cycle_chain(3), 2 * self.RUNS),
+        )
+        for name, chain, runs in cases:
+            with self.subTest(chain=name):
+                outputs, totals = self.sample(chain, "stage2a", 4, runs=runs)
+                self.assert_lossless(chain, outputs)
+                self.assertGreater(totals["promotions"], runs)
+
+    def test_stage2_gates_are_lossless(self):
+        """The LoopSpec gate (0) and a thresholded gate only change which loop-2
+        candidates exist."""
+        chain = mixed_chain(3)
+        for gate in (0.0, 0.5):
+            with self.subTest(gate=gate):
+                outputs, totals = self.sample(chain, "stage2b", 4, stage2_gate=gate)
+                self.assert_lossless(chain, outputs)
+                self.assertGreater(totals["promotions"] + totals["forks"], 0)
+
+    def test_top_p_follows_the_nucleus_of_loop_3(self):
+        """T=0.6, top-p 0.8: commits follow the nucleus of the tempered loop-3
+        chain when every readout is cut, and when proposal_top_p=1 leaves loops 1
+        and 2 whole so that only loop-3 rows (a d1 = 3 review included) are cut."""
+        chain = mixed_chain(3)
+        law = nucleus_law(chain.final, 0.6, 0.8)
+        for stage, d1, proposal in (
+            ("stage2b", 1, None), ("stage2b", 1, 1.0), ("stage1", 3, 1.0),
+        ):
+            with self.subTest(stage=stage, d1=d1, proposal=proposal):
+                shallow = []
+
+                def patch(executor):
+                    original = executor._readout_distributions
+
+                    def recorded(logits, depths):
+                        probs = original(logits, depths)
+                        shallow.extend(
+                            int((row == 0).sum()) for row, d in zip(probs, depths) if d < 3
+                        )
+                        return probs
+
+                    executor._readout_distributions = recorded
+
+                outputs, totals = self.sample(
+                    chain, stage, 4, d1=d1, temperature=0.6, top_p=0.8,
+                    proposal_top_p=proposal, patch=patch,
+                )
+                self.assert_lossless(chain, outputs, law)
+                # Power: the untruncated tempered law is rejected.
+                uncut = nucleus_law(chain.final, 0.6, 1.0)
+                self.assertLess(min(pvalues(chain, outputs, uncut)), 1e-3)
+                if d1 == 3:
+                    self.assertFalse(shallow)  # no readout below the last loop
+                else:
+                    self.assertEqual(max(shallow) == 0, proposal == 1.0)
+                    self.assertGreater(totals["promotions"] + totals["forks"], 0)
+
+    def test_wrong_proposals_are_detected(self):
+        """Power of these checks at the draws they use. The law breaks when a
+        frozen child is verified against p_1 instead of one-hot, a fork against
+        p_2 instead of its residual, or a token accepted in a promotion
+        re-review against p_1 instead of p_2."""
+        accepted = "promotion_accepted"
+        wrong = {
+            "frozen": (mixed_chain(3), lambda c: c.role == "frozen", 1, self.RUNS),
+            "fork": (mixed_chain(3), lambda c: c.role == "fork", 2, self.RUNS),
+            "promoted suffix": (
+                cycle_chain(3), lambda c: c.origin == accepted, 1, 2 * self.RUNS
+            ),
+        }
+        for name, (chain, affected, depth, runs) in wrong.items():
+            with self.subTest(wrong=name):
+
+                def patch(executor):
+                    original = executor._proposal
+                    executor._proposal = (
+                        lambda c: c.parent.dists[depth] if affected(c) else original(c)
+                    )
+
+                outputs, _ = self.sample(chain, "stage2b", 4, runs=runs, patch=patch)
+                self.assertLess(min(pvalues(chain, outputs)), 1e-3)
+
+    def test_sampling_check_compares_loops_1_and_2_with_loop_3(self):
+        """The recorded check stays calibrated, and its tv_d1 and tv_d2 columns
+        are the distances of the verified token's loop-1 and loop-2 laws from
+        its loop-3 law: a readout kept under another depth would show here."""
+        chain = mixed_chain(3)
+        executor = FinalizedTreeExecutor(
+            MarkovRunner(chain), MarkovDraft(chain), 4, "stage2b", temperature=1.0,
+            record_sampling_check=True,
+        )
+        rows = collections.defaultdict(list)
+        for seed in range(600):
+            check = executor.generate([0, 1], 8, [], seed=seed)["sampling_check"]
+            for name, values in check.items():
+                rows[name] += values
+        p, above, squares = (torch.tensor(rows[n], dtype=torch.float64) for n in
+                             ("token_probability", "more_probable_mass", "sum_squares"))
+        gap = p - squares
+        self.assertLess(abs(float(gap.mean() / (gap.std() / len(gap) ** 0.5))), 4)
+        pit = above + torch.rand(len(p), generator=torch.Generator().manual_seed(1),
+                                 dtype=torch.float64) * p
+        self.assertGreater(float(kstest(pit.numpy(), "uniform").pvalue), 1e-3)
+        distances = {d: 0.5 * (chain.final - chain.readouts[d]).abs().sum(-1) for d in (1, 2)}
+        # The two loops are told apart: no token has the same distance at both.
+        self.assertGreater(float((distances[1][:, None] - distances[2]).abs().min()), 1e-3)
+        for name, depth in (("tv_d1", 1), ("tv_d2", 2)):
+            recorded = torch.tensor(rows[name])
+            nearest = (recorded[:, None] - distances[depth]).abs().min(-1).values
+            self.assertLess(float(nearest.max()), 1e-5)
+
+    def test_runner_protocols_draw_the_same_tokens(self):
+        """A seed fixes the output, and the laws read through fused readouts or
+        node state (the protocols of an input/looped/output-block target) commit
+        the same tokens as the span protocol checked above. The repeats end at
+        the last context position: sampled anchors, forks and bonus tokens stay
+        inside prompt + max_new, or the fake refuses them."""
+        chain = mixed_chain(3)
+        for stage, d1 in self.SCHEDULES:
+            with self.subTest(stage=stage, d1=d1):
+                first, _ = run(chain, stage, 4, d1=d1, runs=40)
+                self.assertGreater(len(set(first)), 1)
+                for protocol in (None, FusedReadoutRunner, NodeStateRunner):
+                    again, _ = run(
+                        chain, stage, 4, d1=d1, runs=40, protocol=protocol, tight=True
+                    )
+                    self.assertEqual(again, first)
+
+
+class DeeperScheduleSamplingTests(unittest.TestCase):
+    """Every review depth of R = 4 and R = 5, as a variable-loop Inkling2 checkpoint run with more passes
+    schedules them: Stage 1 at each d1 and Stage 2b at each pair d1 < d2 < R, on the Inkling2 path
+    (prefetched reviews, top-p read from the most probable tokens)."""
+
+    RUNS = 2000
+
+    def schedules(self, loops):
+        return ([("stage1", d1, 2) for d1 in range(1, loops + 1)]
+                + [("stage2b", d1, d2) for d1 in range(1, loops) for d2 in range(d1 + 1, loops)])
+
+    def test_every_depth_matches_the_loop_r_chain(self):
+        for loops in (4, 5):
+            chain = mixed_chain(loops)
+            for stage, d1, d2 in self.schedules(loops):
+                with self.subTest(loops=loops, stage=stage, d1=d1, d2=d2):
+                    outputs, totals = run(chain, stage, 4, d1=d1, d2=d2, runs=self.RUNS, prefetch=True)
+                    self.assertGreater(min(pvalues(chain, outputs)), 1e-3)
+                    self.assertEqual(totals["frozen_created"] > 0, d1 < loops)
+                    # The chain's loops from 3 on below R share one law: a second review there agrees.
+                    differ = not torch.equal(chain.readouts[d1], chain.readouts[d2])
+                    self.assertEqual(totals["forks"] > 0, stage == "stage2b" and differ)
+
+    def test_every_depth_follows_the_nucleus_when_the_proposals_are_cut_like_the_target(self):
+        """T = 0.6, top-p 0.8 on every readout: commits follow the nucleus of the tempered loop-R chain and
+        not the uncut one."""
+        for loops in (4, 5):
+            chain = mixed_chain(loops)
+            law, uncut = nucleus_law(chain.final, 0.6, 0.8), nucleus_law(chain.final, 0.6, 1.0)
+            for stage, d1, d2 in self.schedules(loops):
+                with self.subTest(loops=loops, stage=stage, d1=d1, d2=d2):
+                    outputs, totals = run(chain, stage, 4, d1=d1, d2=d2, runs=self.RUNS, temperature=0.6, top_p=0.8,
+                                          proposal_top_p=0.8, nucleus_width=V, prefetch=True)
+                    self.assertGreater(min(pvalues(chain, outputs, law)), 1e-3)
+                    self.assertLess(min(pvalues(chain, outputs, uncut)), 1e-3)
+                    self.assertEqual(totals["nucleus_sorts"], 0)
+
+
+class TwoLoopSamplingTests(unittest.TestCase):
+    """R = 2 (Nanbeige) on the shared fakes: Stage 1 at d1 = 1 is the method."""
+
+    def test_stage_1_matches_the_loop_2_chain(self):
+        """The loop-count parameter of the fakes keeps the R = 2 law: block
+        drafting reviewed at loop 1, and its k = 1 control, sample loop 2."""
+        chain = mixed_chain(2)
+        for k in (1, 4):
+            with self.subTest(k=k):
+                outputs, totals = run(chain, "stage1", k, runs=2000)
+                self.assertGreater(min(pvalues(chain, outputs)), 1e-3)
+                self.assertGreater(totals["bonus_tokens"], 0)
+                self.assertEqual(totals["frozen_commits"] > 0, k > 1)
 
 
 class ProbabilityReadback(unittest.TestCase):

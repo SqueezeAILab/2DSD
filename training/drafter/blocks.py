@@ -1,14 +1,19 @@
-"""Depth-conditioned DFlash blocks: sampling, labels and chain mask, loop-context queries and mask.
+"""Depth-conditioned drafter blocks: sampling, labels and chain mask, loop-context queries and mask.
 
 Notation for one block (code name -> paper name):
   a      ("anchor" in code) the last position whose target feature is injected, just before the paper's anchor
   d      its depth in 1..R; d = R means fully verified, the original DFlash setting
   L_if   in-flight positions a-L_if .. a-1 before it: drafted but not yet verified
   v      last verified position (a for d = R, else a - L_if - 1); positions <= v use loop-R features
-  slot 0 ("head" in code; the paper's anchor) the given token at a+1; slots 1..k-1 predict a+2 .. a+k
+  slot 0 ("head" in code; the paper's anchor) the given token at a+1; the block drafts a+2 .. a+k
+
+A block of length k drafts the k - 1 tokens after its head. Two slot layouts (anchor_predicts):
+  DFlash  k slots at a+1 .. a+k: the head and k - 1 masks, each mask predicting the token at its own position.
+  DSpark  k - 1 slots at a+1 .. a+k-1: the head and k - 2 masks, every slot predicting the token after its
+          position, so the head's slot drafts the first token ("the anchor as the first prediction position").
 
 Loop-context input: positions <= v inject loop-R features and v+1 .. a inject loop-d features, so the
-in-flight span is target context like the verified prefix. Queries are the k block slots (slot 0 is
+in-flight span is target context like the verified prefix. Queries are the block's slots (slot 0 is
 the head token, slots >= 1 the mask), attending bidirectionally within the block.
 KV layout: [loop-1 .. loop-R features of every packed position (R * T) | queries].
 d = R gives v = a and an empty loop-d span, i.e. standard DFlash.
@@ -82,14 +87,15 @@ def sample_blocks(p: Packed, nb: int, R: int, k_max: int, d_weights: dict, rng: 
     return Blocks(t("a"), t("d"), t("lif"), t("k"), t("doc"), t("valid", torch.bool))
 
 
-def block_labels(p: Packed, b: Blocks, k_max: int):
+def block_labels(p: Packed, b: Blocks, k_max: int, chain: bool = True):
     """Labels [NB, k_max-1] and their validity for drafted slots i >= 1.
 
-    Slot i predicts the token at a+1+i; its label is argmax p_T at a+i. Chain mask: slot i is a valid
-    greedy target only if the trace followed argmax p_T for every token from slot 0 through slot i-1
-    (trace/label numerics can disagree, ~0.5%/token). In a sampled trace the head is a sample, as a
-    sampled anchor or bonus is at T > 0, so the chain starts at slot 1 there: later slots still follow
-    the argmax chain after the head.
+    Slot i predicts the token at a+1+i; its label is argmax p_T at a+i. Chain mask (the DFlash recipe):
+    slot i is a valid greedy target only if the trace followed argmax p_T for every token from slot 0
+    through slot i-1 (trace/label numerics can disagree, ~0.5%/token). In a sampled trace the head is a
+    sample, as a sampled anchor or bonus is at T > 0, so the chain starts at slot 1 there: later slots still
+    follow the argmax chain after the head. chain=False (the DSpark recipe) keeps every slot inside the
+    document: the target's distribution at a position is its training target whatever the trace before it.
     """
     dev = p.input_ids.device
     T = p.input_ids.numel()
@@ -98,6 +104,9 @@ def block_labels(p: Packed, b: Blocks, k_max: int):
     labels = p.final_argmax[lab_pos]
     doc_end = torch.tensor([e for (_s, _r, e, _d) in p.docs] + [0], device=dev)[b.doc.clamp(min=-1)]
     in_doc = (b.a[:, None] + 1 + i) < doc_end[:, None]
+    lab_valid = in_doc & (i < b.k[:, None]) & b.valid[:, None]
+    if not chain:
+        return labels, lab_valid
     m = torch.arange(0, k_max - 1, device=dev)[None, :]
     nxt = (b.a[:, None] + 1 + m).clamp(0, T - 1)
     agree = p.input_ids[nxt] == p.final_argmax[(b.a[:, None] + m).clamp(0, T - 1)]
@@ -105,8 +114,7 @@ def block_labels(p: Packed, b: Blocks, k_max: int):
         agree[:, 0] |= p.doc_sampled[b.doc.clamp(min=0)]
     agree = agree.long()
     chain_ok = torch.cumprod(agree, dim=1).bool()  # chain_ok[:, i-1] covers slots 0..i-1
-    lab_valid = in_doc & chain_ok & (i < b.k[:, None]) & b.valid[:, None]
-    return labels, lab_valid
+    return labels, lab_valid & chain_ok
 
 
 def verified_end(b: Blocks, R: int):
@@ -114,37 +122,44 @@ def verified_end(b: Blocks, R: int):
     return torch.where(b.d == R, b.a, b.a - b.lif - 1)
 
 
-def build_context_inputs(p: Packed, b: Blocks, R: int, k_max: int):
-    """loop-context queries: slot 0 holds the head token at a+1, slots 1..k-1 the mask."""
+def build_context_inputs(p: Packed, b: Blocks, R: int, k_max: int, chain: bool = True, anchor_predicts: bool = False):
+    """loop-context queries: slot 0 holds the head token at a+1, the later slots the mask. S slots per block
+    (k_max, or k_max - 1 when the head's slot predicts); q_index [NB, k_max-1] is the slot that predicts each
+    drafted token, q_tok the trace token at every slot's position."""
     dev = p.input_ids.device
     T = p.input_ids.numel()
     nb = b.a.numel()
-    slot = torch.arange(k_max, device=dev)[None, :]
-    q_valid = (slot < b.k[:, None]) & b.valid[:, None]
+    first = 0 if anchor_predicts else 1  # the first slot that predicts
+    slots = k_max - 1 + first
+    slot = torch.arange(slots, device=dev)[None, :]
+    q_valid = (slot < b.k[:, None] - 1 + first) & b.valid[:, None]
     q_tok = p.input_ids[(b.a[:, None] + 1 + slot).clamp(0, T - 1)]
-    q_is_mask = (slot >= 1).expand(nb, k_max)
+    q_is_mask = (slot >= 1).expand(nb, slots)
     q_pos = p.pos[b.a][:, None] + 1 + slot
-    labels, lab_valid = block_labels(p, b, k_max)
-    q_index = torch.arange(nb, device=dev)[:, None] * k_max + torch.arange(1, k_max, device=dev)[None, :]
+    labels, lab_valid = block_labels(p, b, k_max, chain)
+    q_index = torch.arange(nb, device=dev)[:, None] * slots + torch.arange(first, slots, device=dev)[None, :]
     return dict(q_tok=q_tok.reshape(-1), q_is_mask=q_is_mask.reshape(-1), q_pos=q_pos.reshape(-1),
-                q_valid=q_valid.reshape(-1), labels=labels, lab_valid=lab_valid, q_index=q_index, S=k_max)
+                q_valid=q_valid.reshape(-1), labels=labels, lab_valid=lab_valid, q_index=q_index, S=slots)
 
 
-def build_context_mask(p: Packed, b: Blocks, R: int, k_max: int):
-    mask_mod, q_len, kv_len = context_mask_mod(p, b, R, k_max)
+def build_context_mask(p: Packed, b: Blocks, R: int, k_max: int, anchor_predicts: bool = False):
+    mask_mod, q_len, kv_len = context_mask_mod(p, b, R, k_max, anchor_predicts)
     return _compiled_create_block_mask(mask_mod, B=None, H=None, Q_LEN=q_len, KV_LEN=kv_len,
                                        device=p.input_ids.device), mask_mod
 
 
-def context_mask_mod(p: Packed, b: Blocks, R: int, k_max: int):
+def context_mask_mod(p: Packed, b: Blocks, R: int, k_max: int, anchor_predicts: bool = False):
     """loop-context mask_mod plus (Q_LEN, KV_LEN). KV: [loop r features at kv = r * T + t | queries]."""
     T = p.input_ids.numel()
     nb = b.a.numel()
-    Q = nb * k_max
+    slots = k_max - 1 if anchor_predicts else k_max  # query slots per block; a block of length k uses the
+    blk_k = b.k - 1 if anchor_predicts else b.k      # first k - 1 (or k) of them
+    Q = nb * slots
     C = R * T
     doc = p.doc_ids
-    blk_doc, blk_a, blk_d, blk_k, blk_ok = b.doc, b.a, b.d, b.k, b.valid
+    blk_doc, blk_a, blk_d, blk_ok = b.doc, b.a, b.d, b.valid
     blk_v = verified_end(b, R)
+    k_max = slots
 
     def mask_mod(_b, _h, q, kv):
         jb = q // k_max

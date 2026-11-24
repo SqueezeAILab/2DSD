@@ -251,8 +251,8 @@ class DrafterOnDory(unittest.TestCase):
         with torch.no_grad():
             drafter.mask_emb.copy_(target.embed.weight[90])
 
-        def dense_mask(p, b, R, k):
-            mask_mod, q_len, kv_len = context_mask_mod(p, b, R, k)
+        def dense_mask(p, b, R, k, anchor_predicts=False):
+            mask_mod, q_len, kv_len = context_mask_mod(p, b, R, k, anchor_predicts)
             return create_mask(mask_mod, None, None, q_len, kv_len, "cpu"), mask_mod
 
         # One block per depth; the last one is a verified (d = R) block.

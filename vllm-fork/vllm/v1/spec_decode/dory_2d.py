@@ -137,8 +137,14 @@ def run_dory_finalized(
                 dtype=runner.dtype,
                 use_cuda_graph=use_cuda_graph and context_cuda_graph is not False,
                 batched_graph_min_calls=context_graph_min_calls,
+                # DSpark heads decide the tokens from the slots' states after the
+                # backbone pass, so its fast graphs end before the head.
                 fast_grid=(
-                    dict(head_weight=runner.w.head, head_scale=runner.w.head_scale)
+                    (
+                        True
+                        if metadata.get("dspark")
+                        else dict(head_weight=runner.w.head, head_scale=runner.w.head_scale)
+                    )
                     if drafter_fast_grid
                     else None
                 ),
@@ -176,7 +182,9 @@ def run_dory_finalized(
         prewarm["scope"] = "once_per_rpc_before_measured_requests"
         drafter_prewarm = (
             adapter.prewarm_grid(k, *drafting_grid(runner.R, k))
-            if context_graph_grid and adapter is not None
+            # The padded grid reads the masks after the anchor; a DSpark drafter
+            # whose anchor slot predicts drafts on the layout path.
+            if context_graph_grid and adapter is not None and adapter.first_slot == 1
             else {"enabled": False}
         )
         for _ in range(warmup):

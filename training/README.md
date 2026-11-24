@@ -168,6 +168,59 @@ python -m training.drafter.export --checkpoint runs/drafter/dory1.0-4b/drafter/b
     --out runs/export/dory1.0-4b
 ```
 
+### Drafter kind and block size
+
+`--drafter NAME:LAYERS:DEPTH_WEIGHTS[:RECIPE]` selects the recipe: `ce-dpace` (default) trains the paper's
+DFlash drafter, `dspark` a [DSpark](https://arxiv.org/abs/2607.05147) drafter with a sequential (Markov)
+head and a confidence head. `--k-max` sets the block size (the given token and `K - 1` drafted ones).
+Both replace the config's values:
+
+```bash
+torchrun --standalone --nproc-per-node 8 -m training.drafter.train \
+    --config configs/drafter/ouro-1.4b-thinking-w64.json --target-path W64_CHECKPOINT \
+    --traces runs/traces/ouro-1.4b-w64 --out runs/drafter/ouro-1.4b-w64-dspark --resume \
+    --drafter "dspark:5:1=0.5,2=0.125,3=0.125,4=0.25:dspark" --save-every 500
+python -m training.drafter.export --checkpoint runs/drafter/ouro-1.4b-w64-dspark/dspark/best.pt \
+    --out runs/export/ouro-1.4b-w64-dspark --target-path W64_CHECKPOINT --target-name ORG/W64_REPO
+```
+
+The export records its kind, and `scripts/benchmark.py --drafter EXPORT` runs either one.
+`--save-every STEPS` also writes `last.pt` inside an epoch. After an export, check that the run-time
+adapter drafts what the training module drafts:
+
+```bash
+python scripts/check_drafter_export.py --model ouro-1.4b-thinking --target w64 --target-path W64_CHECKPOINT \
+    --drafter runs/export/ouro-1.4b-w64-dspark --traces runs/traces/ouro-1.4b-w64/dev.jsonl
+```
+
+### Inkling 2
+
+The fork cannot serve Inkling 2, so its traces come from the official vLLM build:
+`scripts/inkling2/serve_rollout.sh` starts one OpenAI-compatible server of the checkpoint per GPU in the
+vendor's image (Docker; the servers answer to the name `inkling-2-mini` with the trace budget of 16,384
+tokens), and one client per server works through the queue. The drafter trains on the per-loop model
+with a DSpark recipe ([inkling-2-mini.json](../configs/drafter/inkling-2-mini.json),
+[inkling-2-mini-varloop.json](../configs/drafter/inkling-2-mini-varloop.json)).
+
+```bash
+# On an H100 the image needs three patched files: serve_official.sh --make-hopper-patches DIR writes them,
+# and --hopper-patches DIR mounts them.
+for g in 0 1; do scripts/inkling2/serve_rollout.sh $g $((8100 + g)); done
+python -m training.drafter.traces_remote launch --out runs/traces/inkling-2-mini --model inkling-2-mini \
+    --prompts runs/prompts-v2 --servers http://127.0.0.1:8100 http://127.0.0.1:8101
+python -m training.drafter.traces_remote collect --out runs/traces/inkling-2-mini
+torchrun --standalone --nproc-per-node 8 -m training.drafter.train \
+    --config configs/drafter/inkling-2-mini.json --traces runs/traces/inkling-2-mini \
+    --out runs/drafter/inkling-2-mini --target-tensor-cores --resume
+python -m training.drafter.export --checkpoint runs/drafter/inkling-2-mini/dspark/best.pt \
+    --out runs/export/inkling-2-mini
+```
+
+`--target-tensor-cores` runs the frozen target about four times faster on an H100; an 80 GB card needs
+`--micro-blocks 128` with it. For the variable-loop checkpoint pass `--repo` and `--revision` of
+`configs/models.json` to `serve_rollout.sh`, `--model inkling-2-mini-varloop --served-model inkling-2-mini`
+to `traces_remote launch` and `--config configs/drafter/inkling-2-mini-varloop.json` to the trainer.
+
 ## Tests
 
 ```bash

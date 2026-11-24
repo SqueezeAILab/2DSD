@@ -95,19 +95,29 @@ class Helpers(unittest.TestCase):
 class FakeEngines:
     """vllm modules for scripts/benchmark.py: TwoDSD journals each result with its metadata, as the worker
     extension does, and LLM returns the whole budget; generated records each engine call (ids for TwoDSD,
-    the number of prompts for LLM)."""
+    the number of prompts for LLM) and eos the EOS ids each TwoDSD call was given (None: the engine's)."""
 
     def __init__(self, model_type="ouro"):
-        self.generated, self.constructed, self.model_types = [], [], []
+        self.generated, self.constructed, self.model_types, self.eos, self.engine_kwargs = [], [], [], [], []
+        self.runtime = {}  # the defaults of twodsd.inkling2_runtime; empty: only what the command line asks
+        self.expert_backend = "eager"  # twodsd.inkling2_expert_backend of that runtime
+        self.proposal_top_p = []
         engines = self
 
         class TwoDSD:
             def __init__(self, model, drafter, **options):
                 engines.constructed.append({"model": model, "drafter": drafter, "revision": options["revision"],
                                             "kv_policy": options["kv_policy"]})
+                engines.engine_kwargs.append({name: options[name]
+                                              for name in ("plain", "experts", "drafter_of_other_target",
+                                                           "loops", "drafter_of_other_loops", "runner",
+                                                           "tensor_cores", "drafter_cuda_graph")
+                                              if name in options})
 
             def generate(self, prompts, *, max_new_tokens, metadata, journal_path, **options):
                 engines.generated.append([m["id"] for m in metadata])
+                engines.eos.append(options.get("eos_token_ids"))
+                engines.proposal_top_p.append(options.get("proposal_top_p", "engine default"))
                 with open(journal_path, "a") as journal:
                     for budget, extra in zip(max_new_tokens, metadata):
                         result = {"output_ids": [5] * budget, "prefill_seconds": 0.1, "decode_seconds": 1.0,
@@ -138,6 +148,8 @@ class FakeEngines:
 
         twodsd.model_type = fake_model_type
         twodsd.engine_options = lambda model, revision, kv_policy: {"kv_policy": kv_policy}
+        twodsd.inkling2_runtime = lambda chosen: dict(self.runtime, **chosen)
+        twodsd.inkling2_expert_backend = lambda runtime: self.expert_backend
         vllm = types.ModuleType("vllm")
         vllm.LLM, vllm.SamplingParams = LLM, lambda **params: SimpleNamespace(**params)
         self.modules = {"vllm": vllm, "vllm.v1.spec_decode.twodsd": twodsd}
@@ -401,6 +413,225 @@ class RegistryNames(BenchmarkRun):
         with self.assertRaises(SystemExit):  # the original target is another run
             self.run_benchmark("--target", "original", model="ouro-1.4b-thinking", drafter=None)
         self.assertIn("different drafter, model, revision", self.stderr.getvalue())
+
+
+class Inkling2(BenchmarkRun):
+    """inkling-2-mini and checkpoints of model_type inkling2_loop: the pinned checkpoint, fixed EOS ids,
+    per-loop KV unless sharing is asked for, no registry drafter, and its own runner for --method ar."""
+
+    PIN = {"model": MODELS["inkling-2-mini"]["repo_id"], "revision": MODELS["inkling-2-mini"]["revision"],
+           "drafter": None, "kv_policy": "native"}
+
+    def identity(self, out):
+        identity = self.lines(out)[0]["run_identity"]
+        return {key: identity[key] for key in ("model", "revision", "drafter", "kv_policy")}
+
+    def test_the_name_runs_its_pinned_original_target_with_fixed_eos_ids(self):
+        """The default target is the only one it has, and the run passes EOS [200006] to the engine."""
+        for extra in ((), ("--target", "original")):
+            with self.subTest(extra=extra):
+                out = self.root / f"inkling-{len(extra)}.jsonl"
+                self.run_benchmark("--block-size", "1", *extra, model="inkling-2-mini", drafter=None, out=out)
+                self.assertEqual(self.identity(out), self.PIN)
+                self.assertEqual(self.engines.constructed[-1], self.PIN)
+                self.assertEqual(self.engines.eos[-1], [200006])
+                self.assertIn("kv_policy native", self.stderr.getvalue())
+        self.assertEqual(self.engines.model_types, [])  # the registry gives the family
+        self.assertEqual(self.PIN["revision"], "1fb4134b9a74f9681054f4ef82e4bf1f458a2337")
+
+    def test_the_other_families_leave_eos_to_the_engine(self):
+        """Guards their EOS rule (the union read from the checkpoint): the script passes no list."""
+        for index, model in enumerate(("ouro-1.4b-thinking", "nanbeige4.2-3b", "dory1.0-4b", "m")):
+            self.run_benchmark(model=model, drafter="d" if model == "m" else None, out=self.root / f"{index}.jsonl")
+        self.assertEqual(self.engines.eos, [None] * 4)
+
+    def test_a_block_needs_an_explicit_drafter(self):
+        """The registry has no Inkling2 drafter: a drafting run fails with that reason, an explicit
+        --drafter runs."""
+        with self.assertRaises(SystemExit):
+            self.run_benchmark(model="inkling-2-mini", drafter=None)
+        self.assertIn("inkling-2-mini has no published drafter", self.stderr.getvalue())
+        self.assertEqual(self.engines.constructed, [])
+        self.run_benchmark(model="inkling-2-mini", drafter="me/drafter@1")
+        self.assertEqual(self.identity(self.out), dict(self.PIN, drafter="me/drafter@1"))
+
+    def test_inkling2_has_no_kv_sharing(self):
+        """By registry name and for a checkpoint outside the registry: the per-loop policy reaches the engine
+        and the run identity, a shared target or policy is refused before an engine is built, and
+        --kv-policy still does not apply to other families."""
+        out = self.root / "native.jsonl"
+        self.run_benchmark("--block-size", "1", "--kv-policy", "native", model="inkling-2-mini", drafter=None, out=out)
+        self.assertEqual(self.identity(out), dict(self.PIN, kv_policy="native"))
+        self.assertEqual(self.engines.constructed[-1]["kv_policy"], "native")
+        built = len(self.engines.constructed)
+        for model, extra in (("inkling-2-mini", ("--target", "w64")), ("inkling-2-mini", ("--kv-policy", "w64"))):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                self.run_benchmark("--block-size", "1", *extra, model=model, drafter=None, out=self.root / "shared.jsonl")
+            self.assertIn("per-loop KV only", self.stderr.getvalue())
+        self.assertEqual(len(self.engines.constructed), built)
+        self.engines = FakeEngines(model_type="inkling2_loop")
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--kv-policy", "w64", model="local/inkling")
+        self.assertIn("per-loop KV only", self.stderr.getvalue())
+        self.assertEqual(self.engines.constructed, [])
+        self.run_benchmark(model="local/inkling")
+        self.assertEqual(self.identity(self.out)["kv_policy"], "native")
+        self.engines = FakeEngines(model_type="ouro")
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--kv-policy", "w64", model="local/ouro", out=self.root / "ouro.jsonl")
+        self.assertIn("--kv-policy applies to Dory only", self.stderr.getvalue())
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--experts", "packed", model="local/ouro", out=self.root / "ouro.jsonl")
+        self.assertIn("--experts and --runner apply to Inkling2 only", self.stderr.getvalue())
+        self.assertEqual(self.engines.constructed, [])
+
+    def test_another_backend_does_not_resume_a_run(self):
+        """The expert backend and the drafter's graphs change the arithmetic or the drafts: a run started
+        without one is not continued with it."""
+        base = dict(model="inkling-2-mini", drafter="me/drafter@1")
+        self.run_benchmark(**base)
+        before = self.out.read_bytes()
+        for extra, field in ((("--experts", "packed"), "experts"),
+                             (("--drafter-cuda-graph",), "drafter_cuda_graph"),
+                             (("--drafter-of-other-target",), "drafter_of_other_target")):
+            with self.subTest(field=field), self.assertRaises(SystemExit):
+                self.run_benchmark(*extra, **base)
+            self.assertIn(field, self.stderr.getvalue())
+        self.assertEqual(self.out.read_bytes(), before)
+
+    def test_the_top_p_of_the_proposals_reaches_the_engine_and_names_the_run(self):
+        """--proposal-top-p is an argument of a sampling 2DSD run; without it the engine keeps its default, and
+        a run resumes only with the same value."""
+        sampling = ("--temperature", "0.6", "--top-p", "0.95")
+        self.run_benchmark(*sampling, "--limit", "1")
+        self.assertEqual(self.engines.proposal_top_p, ["engine default"])
+        self.assertNotIn("proposal_top_p", self.lines()[0]["run_identity"])
+        with self.assertRaises(SystemExit):
+            self.run_benchmark(*sampling, "--proposal-top-p", "0.95")
+        self.assertIn("proposal_top_p", self.stderr.getvalue())
+        out = self.root / "cut.jsonl"
+        self.run_benchmark(*sampling, "--proposal-top-p", "0.95", out=out)
+        self.assertEqual(self.engines.proposal_top_p[-1], 0.95)
+        self.assertEqual(self.lines(out)[0]["run_identity"]["proposal_top_p"], 0.95)
+        for extra, method in ((("--proposal-top-p", "0.95"), "2dsd"), ((*sampling, "--proposal-top-p", "0.95"), "ar")):
+            with self.subTest(method=method), self.assertRaises(SystemExit):
+                self.run_benchmark(*extra, method=method, out=self.root / "other.jsonl")
+            self.assertIn("--proposal-top-p applies to 2DSD sampling", self.stderr.getvalue())
+
+    def test_the_number_of_passes_reaches_the_engine_and_names_the_run(self):
+        """--loops runs an Inkling2 checkpoint with another number of passes, which gives other outputs: it is
+        an engine argument of 2DSD and of plain decoding, a run resumes only at the same count, and a run
+        without the flag records nothing (earlier results resume). The drafter of another count is a
+        separate, deliberate flag."""
+        base = dict(model="inkling-2-mini-varloop", drafter="me/drafter@1")
+        self.run_benchmark("--limit", "1", **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {})
+        self.assertNotIn("loops", self.lines()[0]["run_identity"])
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--loops", "4", **base)
+        self.assertIn("loops", self.stderr.getvalue())
+        out = self.root / "four.jsonl"
+        self.run_benchmark("--loops", "4", "--drafter-of-other-loops", "--limit", "1", out=out, **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {"loops": 4, "drafter_of_other_loops": True})
+        identity = self.lines(out)[0]["run_identity"]
+        self.assertEqual((identity["loops"], identity["drafter_of_other_loops"]), (4, True))
+        plain = self.root / "four-ar.jsonl"
+        self.run_benchmark("--loops", "4", "--drafter-of-other-loops", method="ar", out=plain, **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {"plain": True, "loops": 4})
+        self.assertEqual(self.lines(plain)[0]["run_identity"]["loops"], 4)
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--loops", "4", model="ouro-1.4b-thinking", drafter=None, out=self.root / "ouro.jsonl")
+        self.assertIn("--loops and --drafter-of-other-loops apply to Inkling2 only", self.stderr.getvalue())
+
+    def test_the_drafter_kind_chooses_a_registry_drafter(self):
+        """--drafter-kind dflash is the default drafter of a registry name; dspark has none published yet,
+        which is an error before an engine is built, as is a kind next to an explicit --drafter."""
+        self.run_benchmark("--drafter-kind", "dflash", "--limit", "1", model="ouro-1.4b-thinking", drafter=None)
+        self.assertEqual(self.engines.constructed[-1]["drafter"], MODELS["ouro-1.4b-thinking"]["drafters"]["w64"])
+        built = len(self.engines.constructed)
+        for extra, drafter, message in ((("--drafter-kind", "dspark"), None, "no published dspark drafter"),
+                                        (("--drafter-kind", "dspark"), "me/export", "the export itself tells its kind")):
+            with self.subTest(drafter=drafter), self.assertRaises(SystemExit):
+                self.run_benchmark(*extra, model="ouro-1.4b-thinking", drafter=drafter, out=self.root / "kind.jsonl")
+            self.assertIn(message, self.stderr.getvalue())
+        self.assertEqual(len(self.engines.constructed), built)
+
+    def test_inkling2_runs_the_runtime_of_the_engine_defaults_unless_asked_otherwise(self):
+        """Without flags an Inkling2 run takes the engine's default runtime (on a GPU the measured one: static
+        runner, tensor cores, packed experts, drafter graphs), which is part of the run identity; each flag
+        replaces one part, and plain decoding has no drafter graphs."""
+        base = dict(model="inkling-2-mini", drafter="me/drafter@1")
+        measured = {"runner": "static", "tensor_cores": True, "experts": "packed", "drafter_cuda_graph": True}
+        self.engines.runtime = dict(measured)
+        self.run_benchmark("--limit", "1", **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {})  # the engine resolves its own defaults (and warns)
+        identity = self.lines()[0]["run_identity"]
+        self.assertEqual({name: identity[name] for name in measured}, measured)
+        other = self.root / "other.jsonl"
+        self.run_benchmark("--runner", "batched", "--no-tensor-cores", "--experts", "dense",
+                           "--no-drafter-cuda-graph", "--limit", "1", out=other, **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {"runner": "batched", "tensor_cores": False,
+                                                           "experts": "dense", "drafter_cuda_graph": False})
+        identity = self.lines(other)[0]["run_identity"]
+        self.assertEqual(identity["experts"], "dense")
+        self.assertFalse({"runner", "tensor_cores", "drafter_cuda_graph"} & set(identity))
+        with self.assertRaises(SystemExit):  # another runtime is another run
+            self.run_benchmark("--runner", "batched", **base)
+        plain = self.root / "plain.jsonl"
+        self.run_benchmark(method="ar", out=plain, **base)
+        self.assertEqual(self.engines.engine_kwargs[-1], {"plain": True})
+        identity = self.lines(plain)[0]["run_identity"]
+        self.assertEqual((identity["runner"], identity["experts"]), ("static", "packed"))
+        self.assertNotIn("drafter_cuda_graph", identity)
+        # Humming's expert GEMM is part of the identity when it runs, installed or given by --humming DIR;
+        # --humming with a runtime that would not run it is an error.
+        self.assertNotIn("humming", identity)
+        with self.assertRaises(SystemExit):
+            self.run_benchmark("--humming", str(self.root), "--limit", "1", out=self.root / "none.jsonl", **base)
+        self.assertIn("Humming's expert GEMM would not run", self.stderr.getvalue())
+        self.engines.expert_backend = "humming"
+        installed = self.root / "installed.jsonl"
+        self.run_benchmark("--limit", "1", out=installed, **base)
+        self.assertTrue(self.lines(installed)[0]["run_identity"]["humming"])
+        with self.assertRaises(SystemExit):  # the run without it does not continue with it
+            self.run_benchmark(**base)
+
+    def test_a_checkpoint_outside_the_registry_is_inkling2_by_its_model_type(self):
+        self.engines = FakeEngines(model_type="inkling2_loop")
+        self.run_benchmark("--revision", "r1", model="local/inkling")
+        self.assertEqual(self.identity(self.out),
+                         {"model": "local/inkling", "revision": "r1", "drafter": "d", "kv_policy": "native"})
+        self.assertEqual(self.engines.eos, [[200006]])
+        self.assertEqual(self.engines.model_types, ["local/inkling"])
+
+    def test_the_ar_reference_is_its_own_runner_decoding_one_token_at_a_time(self):
+        """This vLLM build has no Inkling2 engine model: --method ar runs the 2DSD engine in its plain mode,
+        without a drafter, and is recorded as method ar."""
+        for index, (model, model_type) in enumerate((("inkling-2-mini", "ouro"), ("local/inkling", "inkling2_loop"))):
+            self.engines = FakeEngines(model_type=model_type)
+            out = self.root / f"ar-{index}.jsonl"
+            with self.subTest(model=model):
+                self.run_benchmark("--experts", "packed", method="ar", model=model, out=out)
+                self.assertEqual(self.engines.constructed[-1]["drafter"], None)
+                self.assertEqual(self.engines.constructed[-1]["kv_policy"], "native")
+                self.assertEqual(self.engines.engine_kwargs, [{"plain": True, "experts": "packed"}])
+                identity = self.lines(out)[0]["run_identity"]
+                self.assertEqual((identity["method"], identity["kv_policy"], identity["drafter"]),
+                                 ("ar", "native", None))
+        self.engines = FakeEngines(model_type="inkling2_loop")
+        self.run_benchmark("--block-size", "1", model="local/inkling", drafter=None, out=self.root / "2dsd.jsonl")
+        self.assertEqual(self.engines.engine_kwargs, [{}])  # 2DSD keeps its schedule
+
+    def test_an_unknown_model_type_is_rejected(self):
+        """Guards the old default: a checkpoint of an unsupported model_type (or one whose config.json
+        declares none) ran with Ouro's settings."""
+        for model_type in ("qwen3", "inkling2", None):
+            self.engines = FakeEngines(model_type=model_type)
+            for method in ("2dsd", "ar"):
+                with self.subTest(model_type=model_type, method=method), self.assertRaises(SystemExit):
+                    self.run_benchmark(method=method, model="org/other")
+                self.assertIn(f"unsupported model_type {model_type!r}", self.stderr.getvalue())
+                self.assertEqual(self.engines.constructed, [])
 
 
 if __name__ == "__main__":

@@ -111,7 +111,9 @@ def run_nanbeige_finalized(
         prewarm["scope"] = "once_per_rpc_before_measured_requests"
         drafter_prewarm = (
             adapter.prewarm_grid(k, *drafting_grid(runner.R, k))
-            if context_graph_grid and adapter is not None
+            # The padded grid reads the masks after the anchor; a DSpark drafter
+            # whose anchor slot predicts drafts on the layout path.
+            if context_graph_grid and adapter is not None and adapter.first_slot == 1
             else {"enabled": False}
         )
         for _ in range(warmup):

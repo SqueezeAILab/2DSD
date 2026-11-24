@@ -10,6 +10,14 @@ from vllm.model_executor.models.looped_kv import (
 )
 
 
+# text_config.loop_config of Inkling-2-Mini's config.json.
+MINI_LOOP = {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64, "is_varloop": False}
+
+
+def inkling2(text_config, **extra):
+    return SimpleNamespace(model_type="inkling2_loop", text_config=text_config, **extra)
+
+
 def ouro(policy=None, window=None, **extra):
     config = SimpleNamespace(total_ut_steps=4, **extra)
     if policy is not None:
@@ -60,6 +68,52 @@ class PolicyOptionTests(unittest.TestCase):
         self.assertEqual(loop_count(ouro()), 4)
         self.assertEqual(loop_count(SimpleNamespace(num_loops=2)), 2)
 
+    def test_loop_count_reads_the_nested_inkling2_passes(self):
+        """Inkling2 keeps its loop count at text_config.loop_config.num_passes; the config arrives as the
+        dict of config.json or as config objects whose sub-configs are dicts or objects."""
+        nested = {"loop_config": dict(MINI_LOOP)}
+        configs = {
+            "config.json dict": {"model_type": "inkling2_loop", "text_config": nested},
+            "object over dicts": inkling2(nested),
+            "object with a dict loop_config": inkling2(SimpleNamespace(loop_config=dict(MINI_LOOP))),
+            "objects": inkling2(SimpleNamespace(loop_config=SimpleNamespace(**MINI_LOOP))),
+            # The text config objects of the two upstream implementations: vLLM PR #69028 keeps the dict
+            # and an unset serving override; transformers PR #51050 keeps the dict next to the count it
+            # copied from it.
+            "vLLM PR text config": inkling2(SimpleNamespace(
+                loop_config=dict(MINI_LOOP), loop_num_passes=None, loop_share_cache=False)),
+            "transformers PR text config": inkling2(SimpleNamespace(
+                loop_config=dict(MINI_LOOP), loop_num_passes=3, loop_layer_index_start=6, loop_layer_index_end=18)),
+        }
+        for name, config in configs.items():
+            with self.subTest(config=name):
+                self.assertEqual(loop_count(config), 3)
+
+    def test_a_config_without_a_loop_count_is_an_error(self):
+        """Guards the dense fall-through: loop_count used to return None for a config it did not know,
+        which callers read as a one-loop model."""
+        unknown = (SimpleNamespace(), SimpleNamespace(model_type="qwen3"), {},
+                   {"model_type": "inkling2", "text_config": {"loop_config": dict(MINI_LOOP)}})
+        for config in unknown:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "No loop count"):
+                loop_count(config)
+        # An inkling2_loop config is read from its nested field only, never from another family's.
+        broken = (inkling2(None), inkling2({}), inkling2({"loop_config": {}}),
+                  inkling2({"loop_config": {"num_passes": "3"}}), inkling2({"loop_config": {"num_passes": 0}}),
+                  SimpleNamespace(model_type="inkling2_loop", num_loops=2))
+        for config in broken:
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "loop_config.num_passes"):
+                loop_count(config)
+
+    def test_an_inkling2_pass_override_must_match_the_checkpoint(self):
+        """A variable-loop serving override (text_config.loop_num_passes) that changes the pass count is
+        rejected rather than ignored: R would silently differ from the passes that run."""
+        loop = {"loop_config": dict(MINI_LOOP, is_varloop=True)}
+        self.assertEqual(loop_count(inkling2({**loop, "loop_num_passes": None})), 3)
+        self.assertEqual(loop_count(inkling2({**loop, "loop_num_passes": 3})), 3)
+        with self.assertRaisesRegex(ValueError, "loop_num_passes = 2"):
+            loop_count(inkling2({**loop, "loop_num_passes": 2}))
+
 
 class TreeWindowTests(unittest.TestCase):
     def test_block_fills_the_window_exactly(self):
@@ -86,6 +140,21 @@ class TreeWindowTests(unittest.TestCase):
         for config in (ouro(), ouro("full"), ouro("full", 4)):
             for k in (1, 4, 16, 1024):
                 check_tree_window(config, k)
+
+    def test_inkling2_has_no_shared_last_rule(self):
+        """Its loop count resolves (3 * 8 <= 64), so the window bound alone would accept sharing on a
+        family that has no sharing rule; per-loop KV passes."""
+        nested = {"loop_config": dict(MINI_LOOP)}
+        shared = inkling2(nested, loopedtf_kv_policy="shared_last", loopedtf_kv_window=64)
+        with self.assertRaisesRegex(ValueError, "Ouro, Nanbeige and Dory"):
+            check_tree_window(shared, 8)
+        for config in (inkling2(nested), inkling2(nested, loopedtf_kv_policy="full")):
+            check_tree_window(config, 16)
+        # Declared model types of the families that share keep the bound.
+        declared = ouro("shared_last", 32, model_type="ouro")
+        check_tree_window(declared, 8)
+        with self.assertRaisesRegex(ValueError, r"R \* k <= W"):
+            check_tree_window(declared, 9)
 
     def test_invalid_options_fail_before_the_bound(self):
         with self.assertRaisesRegex(ValueError, "window"):

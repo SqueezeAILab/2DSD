@@ -3,7 +3,10 @@
 Training reads a packed document through drafter.blocks' loop-context mask; the
 adapter reads a verified-prefix cache plus a per-request loop-d span. Both must
 give the same logits for every depth, in-flight length and block length, also
-when several requests share one weight pass.
+when several requests share one weight pass. A DSpark drafter decides its drafted
+tokens left to right with its heads, in the same block or in the DSpark paper's,
+whose anchor slot drafts the first token; the adapter's drafts, logits and
+confidences are the training module's.
 """
 
 import os
@@ -120,6 +123,177 @@ class ContextAdapter(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         load()
+
+
+class DSparkContextAdapter(ContextAdapter):
+    """An exported DSpark drafter. ANCHOR_PREDICTS: K - 1 slots per block, the anchor's slot drafting the
+    first token, instead of the anchor and K - 1 masks."""
+
+    RANK = 6
+    ANCHOR_PREDICTS = False
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        super().setUp()
+        torch.manual_seed(7)
+        self.module = DepthDFlash(self.module.cfg, 2, heads={"vocab": V, "rank": self.RANK, "type": self.KIND}).eval()
+        with torch.no_grad():
+            self.module.mask_emb.normal_()
+            for parameter in self.module.parameters():
+                parameter.add_(0.05 * torch.randn_like(parameter))
+            for weight in (self.module.markov_head.markov_w1.weight, self.module.markov_head.markov_w2.weight):
+                weight.normal_()  # a bias large enough to change drafts
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        config = dict(self.adapter.config, block_size=K - self.ANCHOR_PREDICTS, dflash_config={"mask_token_id": 3},
+                      loopedtf_drafter={"input_format": "loop-context",
+                                        "dspark": {"markov_rank": self.RANK, "markov_head_type": self.KIND,
+                                                   "confidence_head_with_markov": True,
+                                                   "sample_from_anchor": self.ANCHOR_PREDICTS}})
+        Path(self.directory.name, "config.json").write_text(json.dumps(config))
+        save_file({k: v.contiguous() for k, v in self.module.state_dict().items() if k != "mask_emb"},
+                  str(Path(self.directory.name, "model.safetensors")))
+        torch.save({"mask_token_id": 3, "embedding": self.module.mask_emb.detach()},
+                   Path(self.directory.name, "mask_embedding.pt"))
+        self.adapter = ContextDFlashAdapter.from_export(
+            self.directory.name, embed=self.embedding, lm_head=self.head, max_len=64, device="cpu",
+            dtype=torch.float32, use_native_ops=False)
+
+    def trained_states(self, blocks):
+        """[(d, a, L_if, k)] -> per block the [k - 1, H] backbone states of the slots that draft its tokens
+        in the training forward."""
+        column = lambda j: torch.tensor([x[j] for x in blocks])
+        b = Blocks(a=column(1), d=column(0), lif=column(2), k=column(3), doc=torch.zeros(len(blocks), dtype=torch.long),
+                   valid=torch.ones(len(blocks), dtype=torch.bool))
+        inp = build_context_inputs(self.packed, b, R, K, anchor_predicts=self.ANCHOR_PREDICTS)
+        first = 0 if self.ANCHOR_PREDICTS else 1
+        self.assertEqual((inp["S"], inp["q_index"][0].tolist()), (K - 1 + first, list(range(first, K - 1 + first))))
+        mask_mod, q_len, kv_len = context_mask_mod(self.packed, b, R, K, anchor_predicts=self.ANCHOR_PREDICTS)
+        mask = create_mask(mask_mod, None, None, q_len, kv_len, "cpu")
+        with torch.no_grad():
+            hidden = self.module(self.packed.feats.reshape(-1, 2 * H)[None], self.embedding(inp["q_tok"])[None],
+                                 inp["q_is_mask"], torch.cat([self.packed.pos.repeat(R), inp["q_pos"]])[None], mask)[0]
+        return [hidden[inp["q_index"][i, : x[3] - 1]] for i, x in enumerate(blocks)]
+
+    def trained_logits(self, blocks):
+        """The training heads decided left to right on those states: logits [k - 1, V] per block."""
+        return [rows for rows, _, _ in self.trained_drafts(blocks)]
+
+    def test_requests_sharing_a_prefix_match_separate_passes(self):
+        blocks = [(1, 26, 6, 8), (2, 23, 3, 5), (3, 20, 0, 8), (1, 21, 1, 1)]
+        self.adapter.reset()
+        batched = self.adapter.context_logits([self.request(*block) for block in blocks])
+        self.assertIsNone(batched[3])
+        for actual, reference in zip(batched, self.trained_logits(blocks[:3])):
+            torch.testing.assert_close(actual, reference, atol=1e-4, rtol=1e-4)
+
+    def trained_drafts(self, blocks):
+        results = []
+        for block, states in zip(blocks, self.trained_states(blocks)):
+            tokens, rows, confidences = [], [], []
+            for slot in range(states.shape[0]):
+                previous = torch.tensor([[int(self.packed.input_ids[block[1] + 1]), *tokens]])
+                with torch.no_grad():
+                    logits, confidence = self.module.head_outputs(states[None, : slot + 1], previous, self.head)
+                rows.append(logits[0, slot])
+                tokens.append(int(logits[0, slot].argmax()))
+                confidences.append(torch.sigmoid(confidence[0, slot]))
+            results.append((torch.stack(rows), tokens, torch.stack(confidences)))
+        return results
+
+    def test_drafts_and_confidences_match_training(self):
+        blocks = [(1, 26, 6, 8), (2, 23, 3, 5), (3, 20, 0, 8), (1, 21, 1, 2)]
+        self.adapter.reset()
+        drafts = self.adapter.draft_context_many([self.request(*block) for block in [*blocks, (1, 21, 1, 1)]])
+        self.assertEqual((drafts[-1].token_ids.numel(), drafts[-1].confidence), (0, None))  # nothing to draft
+        changed = []
+        for draft, (rows, tokens, confidences), states in zip(drafts, self.trained_drafts(blocks),
+                                                              self.trained_states(blocks)):
+            self.assertEqual(draft.token_ids.tolist(), tokens)
+            torch.testing.assert_close(draft.confidence, confidences, atol=1e-4, rtol=1e-4)
+            changed.append(self.head(states).argmax(-1).tolist() != tokens)
+        self.assertTrue(any(changed))  # the Markov bias changes drafts
+
+    def test_a_drafting_vocabulary_restricts_the_drafts_and_nothing_else(self):
+        """With every token in the vocabulary the drafts are those of the whole head. With a subset, a slot
+        drafts the subset's best token given the tokens drafted before it (the training heads, restricted)."""
+        blocks = [(1, 26, 6, 8), (2, 23, 3, 5), (3, 20, 0, 8)]
+        requests = [self.request(*block) for block in blocks]
+        self.adapter.reset()
+        whole = self.adapter.draft_context_many(requests)
+        self.adapter.configure_draft_vocabulary(torch.arange(V), self.adapter.readout)
+        self.adapter.reset()
+        for draft, reference in zip(self.adapter.draft_context_many(requests), whole):
+            self.assertEqual(draft.token_ids.tolist(), reference.token_ids.tolist())
+            torch.testing.assert_close(draft.confidence, reference.confidence)
+        ids = torch.arange(0, V, 3)
+        readout = self.adapter.readout
+        self.adapter.configure_draft_vocabulary(ids, lambda hidden: readout(hidden)[:, ids])
+        self.adapter.reset()
+        drafts = self.adapter.draft_context_many(requests)
+        self.assertNotEqual([d.token_ids.tolist() for d in drafts], [d.token_ids.tolist() for d in whole])
+        for draft, block, states in zip(drafts, blocks, self.trained_states(blocks)):
+            tokens = []
+            for slot in range(states.shape[0]):
+                previous = torch.tensor([[int(self.packed.input_ids[block[1] + 1]), *tokens]])
+                with torch.no_grad():
+                    logits, _ = self.module.head_outputs(states[None, : slot + 1], previous, self.head)
+                tokens.append(int(ids[logits[0, slot][ids].argmax()]))
+            self.assertEqual(draft.token_ids.tolist(), tokens)
+        for bad in (torch.tensor([3, 1]), torch.tensor([0, V]), torch.empty(0, dtype=torch.long)):
+            with self.assertRaisesRegex(ValueError, "sorted list"):
+                self.adapter.configure_draft_vocabulary(bad, readout)
+
+    def test_a_greedy_draft_sums_in_the_heads_dtype(self):
+        """Training adds a BF16 bias to BF16 logits. Two tokens whose logits differ by less than BF16 keeps
+        are then a tie, which the first one wins; an FP32 sum would draft the second."""
+        from vllm.v1.spec_decode.looped_dflash_context import _DSparkHeads
+
+        base = torch.tensor([[1.001953125, 1.00390625]])
+        heads = _DSparkHeads("vanilla", torch.zeros(2, 1), torch.zeros(2, 1, dtype=torch.bfloat16), None, None)
+        self.assertEqual(int(base.argmax(-1)), 1)
+        drafted = heads.draft_base(base)
+        self.assertEqual((drafted.dtype, drafted.tolist(), int(drafted.argmax(-1))), (torch.bfloat16, [[1.0, 1.0]], 0))
+        self.assertIs(self.adapter.dspark.draft_base(base), base)  # FP32 heads on the CPU: unchanged
+        # A head that scales its logits in FP32 (Dory's) trained on the FP32 sum: its logits stay as they are.
+        heads.wide_base = True
+        self.assertIs(heads.draft_base(base), base)
+
+    def test_slots_per_block(self):
+        """Blocks of 8 and 5 draft 7 and 4 tokens: with the anchor and that many masks, or with one slot
+        per drafted token when the anchor's slot predicts. A block is at most the anchor and K - 1 tokens."""
+        blocks = [(1, 26, 6, 8), (2, 23, 3, 5)]
+        before = dict(self.adapter.stats)
+        self.adapter.reset()
+        self.adapter.draft_context_many([self.request(*block) for block in blocks])
+        delta = {k: self.adapter.stats[k] - before.get(k, 0) for k in ("flops_query_rows", "flops_readout_rows")}
+        rows = 7 + 4 if self.ANCHOR_PREDICTS else 8 + 5
+        self.assertEqual(delta, {"flops_query_rows": rows, "flops_readout_rows": 7 + 4})
+        with self.assertRaisesRegex(ValueError, "block length"):
+            self.adapter.draft_context_many([self.request(1, 20, 5, K + 1)])
+        self.adapter.draft_context_many([self.request(1, 20, 5, K)])
+
+    def test_exports_of_other_input_formats_are_rejected(self):
+        self.skipTest("covered by the DFlash export")
+
+
+class VanillaDSparkContextAdapter(DSparkContextAdapter):
+    KIND = "vanilla"
+
+
+class RnnDSparkContextAdapter(DSparkContextAdapter):
+    KIND = "rnn"
+
+
+class AnchorSlotDSparkContextAdapter(DSparkContextAdapter):
+    KIND, ANCHOR_PREDICTS = "vanilla", True
+
+
+del DSparkContextAdapter  # abstract: its subclasses name the head
 
 
 class ContextFlopsCounters(ContextAdapter):

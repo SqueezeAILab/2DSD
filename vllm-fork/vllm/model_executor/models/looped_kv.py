@@ -22,8 +22,15 @@
   depths, applies the same rule to the output block's full-attention layers.
   Dory shares without adaptation, so the keys are passed as configuration
   overrides.
+
+  Inkling2 (block-wise looping, ``model_type`` ``inkling2_loop``) keeps per-loop
+  KV: ``shared_last`` is rejected for it. Its loop count is nested as
+  ``text_config.loop_config.num_passes``, the fixed-loop case of
+  ``Inkling2ModelConfig.num_loop_passes`` in vLLM PR #69028 (head b426b46e,
+  vllm/models/inkling2/configs.py).
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,6 +40,8 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
 POLICIES = ("full", "shared_last")
+SHARED_LAST_MODEL_TYPES = ("ouro", "nanbeige", "dory")
+INKLING2_MODEL_TYPE = "inkling2_loop"
 
 
 @dataclass(frozen=True)
@@ -79,14 +88,57 @@ class PolicyOptions:
             )
 
 
+def _field(config, name: str):
+    """``name`` of a config given as an object or as a dict (None if absent)."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _inkling2_passes(config) -> int:
+    text = _field(config, "text_config")
+    passes = _field(_field(text, "loop_config"), "num_passes")
+    if type(passes) is not int or passes < 1:
+        raise ValueError(
+            "An inkling2_loop config carries its loop count as an integer "
+            f"text_config.loop_config.num_passes >= 1, not {passes!r}"
+        )
+    override = _field(text, "loop_num_passes")
+    if override is not None and override != passes:
+        raise ValueError(
+            f"text_config.loop_num_passes = {override!r} differs from the "
+            f"checkpoint's {passes} passes; 2DSD runs the checkpoint's loop count"
+        )
+    return passes
+
+
 def loop_count(config) -> int:
-    """Number of loops R of an Ouro (total_ut_steps), Nanbeige (num_loops) or Dory
-    (n_recurrent_loops) config."""
-    return (
-        getattr(config, "total_ut_steps", None)
-        or getattr(config, "num_loops", None)
-        or getattr(config, "n_recurrent_loops", None)
+    """Number of loops R of a looped model config.
+
+    Ouro (``total_ut_steps``), Nanbeige (``num_loops``) and Dory
+    (``n_recurrent_loops``) carry it at the top level. Inkling2 (``model_type``
+    ``inkling2_loop``) nests it as ``text_config.loop_config.num_passes``; the
+    config and its sub-configs may be objects or dicts.
+
+    Raises:
+        ValueError: If the config carries no loop count. A model of an unknown
+            family is never treated as a dense (one-loop) model.
+    """
+    model_type = _field(config, "model_type")
+    if model_type == INKLING2_MODEL_TYPE:
+        return _inkling2_passes(config)
+    loops = (
+        _field(config, "total_ut_steps")
+        or _field(config, "num_loops")
+        or _field(config, "n_recurrent_loops")
     )
+    if not loops:
+        raise ValueError(
+            f"No loop count in a config of model_type {model_type!r}: expected "
+            "total_ut_steps (Ouro), num_loops (Nanbeige), n_recurrent_loops (Dory) "
+            "or, for inkling2_loop, text_config.loop_config.num_passes"
+        )
+    return loops
 
 
 def validate_config(config: VllmConfig) -> str:
@@ -96,7 +148,7 @@ def validate_config(config: VllmConfig) -> str:
     options.validate()
     if options.policy == "full":
         return options.policy
-    if hf.model_type not in ("ouro", "nanbeige", "dory"):
+    if hf.model_type not in SHARED_LAST_MODEL_TYPES:
         raise ValueError("shared_last supports Ouro, Nanbeige and Dory models only")
     if options.share_layers != "all" and hf.model_type != "dory":
         raise ValueError("loopedtf_kv_share_layers applies to Dory only")
@@ -161,6 +213,9 @@ def check_tree_window(config, block_size: int) -> None:
     options.validate()
     if options.policy != "shared_last":
         return
+    model_type = getattr(config, "model_type", None)
+    if model_type is not None and model_type not in SHARED_LAST_MODEL_TYPES:
+        raise ValueError("shared_last supports Ouro, Nanbeige and Dory models only")
     loops = loop_count(config)
     if loops * block_size > options.window:
         raise ValueError(

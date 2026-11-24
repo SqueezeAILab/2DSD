@@ -72,6 +72,13 @@ class FinalizedNode:
     # an explicit proposal for children not drawn from a parent readout (forks).
     dists: dict[int, torch.Tensor] = field(default_factory=dict)
     proposal_dist: torch.Tensor | None = None
+    # Sampling with prefetch: what a readout or a draw already brought to the host. ``picked`` holds
+    # values of ``dists`` by (loop, token), ``anchors`` a token drawn from a loop's distribution without
+    # the excluded token, with its probability, as (excluded, token, probability) by loop, ``modes`` the
+    # most probable token by loop.
+    picked: dict[tuple[int, int], float] = field(default_factory=dict)
+    anchors: dict[int, tuple] = field(default_factory=dict)
+    modes: dict[int, int] = field(default_factory=dict)
     order: tuple[int, int] = (0, 0)  # (position, node id): the row order of a call
 
 
@@ -120,9 +127,28 @@ class FinalizedTreeExecutor:
         stage2_gate="argmax",
         top_p=1.0,
         proposal_top_p=None,
+        draft_confidence=None,
+        frozen_suffix=True,
+        nucleus_width=None,
+        prefetch=False,
     ):
         if stage not in ("stage1", "stage2a", "stage2b"):
             raise ValueError("Unknown finalized stage")
+        if nucleus_width is not None and (type(nucleus_width) is not int or nucleus_width < 1):
+            raise ValueError("nucleus_width is a positive number of tokens")
+        # None reads the top-p cut of a target row from vLLM's sort of the vocabulary; a number reads
+        # it from that many most probable tokens of the row (_nucleus).
+        self.nucleus_width = nucleus_width
+        self.nucleus_calls = self.nucleus_sorts = 0
+        # Sampling: False reads a probability from the GPU when a review asks for it. True reads, with
+        # the readout of a call and in one transfer, what its reviews will ask for (_prefetch); the
+        # draws then use the generator in another order, so a seed gives other tokens of the same law.
+        self.prefetch = bool(prefetch)
+        if not frozen_suffix and (stage != "stage1" or temperature > 0):
+            raise ValueError("Only greedy Stage 1 can drop the suffix its review rejects")
+        # A suffix rejected at the d1 review stays in flight as a frozen candidate for the last loop
+        # (and for Stage 2's promotion). False drops it at the review: its rows leave the later calls.
+        self.frozen_suffix = bool(frozen_suffix)
         if temperature < 0:
             raise ValueError("Temperature must be nonnegative")
         proposal_top_p = top_p if proposal_top_p is None else proposal_top_p
@@ -132,6 +158,11 @@ class FinalizedTreeExecutor:
             raise ValueError("top_p applies only when sampling")
         if stage2_gate != "argmax" and not 0 <= float(stage2_gate) < 1:
             raise ValueError("stage2_gate is 'argmax' or a threshold in [0, 1)")
+        if draft_confidence is not None and not 0 <= float(draft_confidence) <= 1:
+            raise ValueError("draft_confidence is a probability")
+        # DSpark's static confidence threshold: a drafted block ends before its first slot whose
+        # predicted acceptance is below it. None keeps every drafted slot.
+        self.draft_confidence = None if draft_confidence is None else float(draft_confidence)
         self.stage2_gate = stage2_gate
         self.temperature = float(temperature)
         self.top_p = float(top_p)
@@ -188,6 +219,9 @@ class FinalizedTreeExecutor:
         node.frozen_suffix.clear()
         node.loop_features.clear()
         node.dists.clear()
+        node.picked.clear()
+        node.anchors.clear()
+        node.modes.clear()
         node.proposal_dist = None
 
     def _child(
@@ -310,7 +344,10 @@ class FinalizedTreeExecutor:
             if child.parent is not parent or child.depth < depth:
                 raise RuntimeError("Block suffix lost ancestry or its review readout")
             if parent.readouts[depth] != child.token:
-                self._freeze(suffix[index:])
+                if self.frozen_suffix:
+                    self._freeze(suffix[index:])
+                else:
+                    self._drop(self._descendants(child))
                 self._new_anchor(parent, depth, f"{cause}_reject")
                 return passed
             child.growing = True
@@ -467,6 +504,90 @@ class FinalizedTreeExecutor:
 
         return gather_probabilities(items, self._probability_buffers)
 
+    def _probabilities(self, items):
+        """p(token) per item: (node, loop, token) for a readout of the node, or (distribution, token).
+        Values that came with a readout or a draw are on the host; the rest take one gather."""
+        values = [item[0].picked.get(item[1:]) if len(item) == 3 else None for item in items]
+        missing = [i for i, value in enumerate(values) if value is None]
+        if missing:
+            rest = (items[i] for i in missing)
+            read = self._gather([(i[0].dists[i[1]], i[2]) if len(i) == 3 else i for i in rest])
+            for i, value in zip(missing, read):
+                values[i] = value
+        return values
+
+    def _readout(self, logits, nodes):
+        """The distributions of a call's readout rows, on their nodes; with prefetch also what the
+        reviews of the call read from them."""
+        depths = [node.depth for node in nodes]
+        if not self.prefetch:
+            probs = self._readout_distributions(logits, depths)
+        elif self._prefetch(probs := self._readout_distributions(logits, depths, True), nodes, self._short):
+            # A row holds less than top_p in its most probable tokens: the sort, and the values again.
+            self.nucleus_sorts += 1
+            probs = self._sorted_distributions(logits, depths)
+            self._prefetch(probs, nodes)
+        for i, node in enumerate(nodes):
+            node.dists[node.depth] = probs[i]
+
+    def _prefetch(self, probs, nodes, short=None):
+        """In one transfer, what the reviews of a call read from its readout rows.
+
+        Each row's probability of its children's tokens: a d1 review and the final verification test
+        those. For a row that a review below loop R can stop at (a growing node at d1, a frozen one
+        at d2) with at most its drafted child, a token drawn from the row without that child's
+        token, with its probability: the anchor the review takes there, after it rejects the child
+        or past the last token of a block that passes. The draw of every such row is made before
+        the review decides which one it uses; the decision does not read the draws, so the one it
+        takes is an exact draw of its row. For Stage 2's argmax gate, the most probable token of
+        the rows at d2. ``short`` is the pending flag of _nucleus: True is returned, and nothing
+        kept, when it is set.
+        """
+        R, width = self.runner.R, probs.shape[-1]
+        picks = [(i, node, token) for i, node in enumerate(nodes) for token in node.children]
+        # A d1 review takes its anchor at a growing node, a promotion's review at a frozen one.
+        reviewed = {self.d1: True} if self.stage == "stage1" else {self.d1: True, self.d2: False}
+        draws = [(i, node, next(iter(node.children), None)) for i, node in enumerate(nodes)
+                 if node.depth < R and len(node.children) < 2 and reviewed.get(node.depth) is node.growing]
+        excluded = [(j, token) for j, (_, _, token) in enumerate(draws) if token is not None]
+        gate = self.stage != "stage1" and self.stage2_gate == "argmax" and any(
+            node.depth == self.d2 for node in nodes
+        )
+        if not (picks or draws or gate or short is not None):
+            return False
+        index = _token_ids_tensor(
+            [i * width + token for i, _, token in picks]
+            + [j * width + token for j, token in excluded]
+            + [i for i, _, _ in draws],
+            probs.device,
+        )
+        a, b = len(picks), len(picks) + len(excluded)
+        parts = [probs.reshape(-1).index_select(0, index[:a])]
+        if gate:
+            parts.append(probs.argmax(-1).to(probs.dtype))
+        if draws:
+            weights = probs.index_select(0, index[b:])
+            if excluded:
+                weights.view(-1).index_fill_(0, index[a:b], 0)
+            tokens = self._draw(weights)
+            parts += [tokens.to(probs.dtype), weights.gather(1, tokens.unsqueeze(1)).squeeze(1)]
+        if short is not None:
+            parts.append(short.to(probs.dtype).reshape(1))
+        values = torch.cat(parts).tolist()
+        if short is not None and values[-1]:
+            return True
+        for (_, node, token), value in zip(picks, values):
+            node.picked[(node.depth, token)] = value
+        offset = a
+        if gate:
+            for i, node in enumerate(nodes):
+                if node.depth == self.d2:
+                    node.modes[self.d2] = int(values[offset + i])
+            offset += len(nodes)
+        for j, (_, node, token) in enumerate(draws):
+            node.anchors[node.depth] = (token, int(values[offset + j]), values[offset + len(draws) + j])
+        return False
+
     def _distribution(self, logits, top_p):
         """Readout law: temperature, then vLLM's top-p mask, then softmax.
 
@@ -484,13 +605,69 @@ class FinalizedTreeExecutor:
             scaled = apply_top_k_top_p_pytorch(scaled, None, p)
         return torch.softmax(scaled, dim=-1)
 
-    def _readout_distributions(self, logits, depths):
-        """Target law for loop-R rows, proposal law for shallower rows."""
+    def _nucleus(self, probs, rows, defer=False):
+        """The top-p cut of ``_distribution`` on rows of probabilities (all rows if ``rows`` is None),
+        in place and without a sort of the vocabulary.
+
+        vLLM's rule keeps a token while the mass ranked above it is below top_p. The ``nucleus_width``
+        most probable tokens of a row, in order, decide that for every token when they hold top_p
+        between them; the row is then those of them that stay, renormalized. Returns False, with
+        ``probs`` as it was, when a row holds less than top_p in them: the caller sorts every target
+        row of the call.
+
+        It is the sort's cut wherever the two were compared, not by construction. Tokens of equal
+        probability on the two sides of the cut are kept in topk's order here and in sort's order
+        there, and the two add the masses in another order, so a row whose mass meets top_p within
+        rounding can be cut one token apart. FP32 logits of a 200,058-token vocabulary showed neither.
+
+        ``defer`` cuts the rows without waiting for the GPU and returns that test as a tensor: when it
+        is set the rows are not distributions, and the caller sorts.
+        """
+        sub = probs if rows is None else probs.index_select(0, rows)
+        values, ids = sub.topk(min(self.nucleus_width, sub.shape[-1]), dim=-1)
+        mass = values.cumsum(-1)
+        short = (mass[:, -1] < self.top_p).any()
+        if not defer and bool(short):
+            return False
+        values[:, 1:].masked_fill_(mass[:, :-1] >= self.top_p, 0)
+        values /= values.sum(-1, keepdim=True)
+        if rows is None:
+            probs.zero_().scatter_(1, ids, values)
+        else:
+            probs.index_fill_(0, rows, 0)
+            flat = rows.unsqueeze(1) * probs.shape[-1] + ids
+            probs.view(-1).scatter_(0, flat.view(-1), values.view(-1))
+        return short if defer else True
+
+    def _readout_distributions(self, logits, depths, defer=False):
+        """Target law for loop-R rows, proposal law for shallower rows. With ``defer`` a cut from the
+        most probable tokens leaves its test in ``_short`` (_nucleus) for the caller to read."""
         R = self.runner.R
-        if self.proposal_top_p == self.top_p or all(d == R for d in depths):
+        target = [i for i, d in enumerate(depths) if d == R]
+        # Every row takes top_p: proposals cut like the target, or a call of target rows only.
+        every = self.proposal_top_p == self.top_p or len(target) == len(depths)
+        self._short = None
+        if self.nucleus_width and self.top_p < 1 and (
+            every or (target and self.proposal_top_p == 1)
+        ):
+            probs = torch.softmax(logits.float() / self.temperature, dim=-1)
+            rows = None if every else _token_ids_tensor(target, logits.device)
+            self.nucleus_calls += 1
+            if defer:
+                self._short = self._nucleus(probs, rows, defer=True)
+                return probs
+            if self._nucleus(probs, rows):
+                return probs
+            self.nucleus_sorts += 1
+        return self._sorted_distributions(logits, depths)
+
+    def _sorted_distributions(self, logits, depths):
+        """_readout_distributions with vLLM's sort for the top-p cut."""
+        R = self.runner.R
+        target = [i for i, d in enumerate(depths) if d == R]
+        if self.proposal_top_p == self.top_p or len(target) == len(depths):
             return self._distribution(logits, self.top_p)
         probs = self._distribution(logits, self.proposal_top_p)
-        target = [i for i, d in enumerate(depths) if d == R]
         if target:
             index = _token_ids_tensor(target, logits.device)
             probs.index_copy_(0, index, self._distribution(logits.index_select(0, index), self.top_p))
@@ -510,14 +687,17 @@ class FinalizedTreeExecutor:
             return None
         return child.parent.dists[child.proposal_depth]
 
-    def _sample_anchors(self, specs, depth, role="main"):
-        """New anchors from (parent, cause, excluded token) in one batched draw.
+    def _proposal_item(self, child):
+        """_proposal as an item of _probabilities for child's own token."""
+        if child.proposal_dist is not None:
+            return (child.proposal_dist, child.token)
+        if child.proposal_depth == 0:
+            return None
+        return (child.parent, child.proposal_depth, child.token)
 
-        A rejected drafter token x leaves p ⊖ one-hot(x), p without x. The new
-        child is still an exact sample of p, so its proposal is p (§7.2.1).
-        """
-        if not specs:
-            return []
+    def _draw_anchors(self, specs, depth):
+        """One token per (parent, cause, excluded token), drawn from the parent's loop-depth
+        distribution without the excluded token, in one batched draw."""
         excluded = [(i, t) for i, (_, _, t) in enumerate(specs) if t is not None]
         weights = (
             specs[0][0].dists[depth].unsqueeze(0)
@@ -530,7 +710,28 @@ class FinalizedTreeExecutor:
                 _token_ids_tensor(list(rows), weights.device),
                 _token_ids_tensor(list(cols), weights.device),
             ] = 0
-        tokens = self._draw(weights).tolist()
+        return self._draw(weights).tolist()
+
+    def _sample_anchors(self, specs, depth, role="main"):
+        """New anchors from (parent, cause, excluded token).
+
+        A rejected drafter token x leaves p ⊖ one-hot(x), p without x. The new
+        child is still an exact sample of p, so its proposal is p (§7.2.1). A
+        parent whose readout came with such a draw (_prefetch) uses it, once.
+        """
+        if not specs:
+            return []
+        tokens, rest = [None] * len(specs), []
+        for i, (parent, _, excluded) in enumerate(specs):
+            ready = parent.anchors.pop(depth, None)
+            if ready is not None and ready[0] == excluded and ready[2] > 0:
+                tokens[i] = ready[1]
+                parent.picked[(depth, ready[1])] = ready[2]
+            else:
+                rest.append(i)
+        if rest:
+            for i, token in zip(rest, self._draw_anchors([specs[i] for i in rest], depth)):
+                tokens[i] = token
         heads = []
         for (parent, cause, _), token in zip(specs, tokens):
             if token in parent.children:
@@ -552,7 +753,7 @@ class FinalizedTreeExecutor:
         for parent, child in pairs:
             if child.parent is not parent or child.depth < depth:
                 raise RuntimeError("Block suffix lost ancestry or its review readout")
-        probabilities = self._gather([(p.dists[depth], c.token) for p, c in pairs])
+        probabilities = self._probabilities([(p, depth, c.token) for p, c in pairs])
         offset, anchors, passed_counts = 0, [], []
         for chain in chains:
             head, suffix = chain[0], chain[1:]
@@ -631,12 +832,14 @@ class FinalizedTreeExecutor:
             return
         self.stats["stage2_reviews"] += len(events)
         if self.stage2_gate == "argmax":  # decisions read only argmax p_d2
-            distributions = (
-                events[0][0].dists[self.d2].unsqueeze(0)
-                if len(events) == 1
-                else torch.stack([p.dists[self.d2] for p, _, _ in events])
-            )
-            modes = distributions.argmax(-1).tolist()
+            modes = [p.modes.get(self.d2) for p, _, _ in events]
+            if None in modes:
+                distributions = (
+                    events[0][0].dists[self.d2].unsqueeze(0)
+                    if len(events) == 1
+                    else torch.stack([p.dists[self.d2] for p, _, _ in events])
+                )
+                modes = distributions.argmax(-1).tolist()
             values = iter(())
         else:
             items = []
@@ -729,11 +932,11 @@ class FinalizedTreeExecutor:
             node = main
         if not chain:
             return {}
-        items = [(n.dists[self.runner.R], m.token) for n, m in chain]
-        proposals = [(self._proposal(m), m.token) for _, m in chain]
-        values = self._gather(items + [(g, t) for g, t in proposals if g is not None])
+        items = [(n, self.runner.R, m.token) for n, m in chain]
+        proposals = [self._proposal_item(m) for _, m in chain]
+        values = self._probabilities(items + [g for g in proposals if g is not None])
         ratios, offset = {}, len(chain)
-        for (n, _), (g, _), t in zip(chain, proposals, values):
+        for (n, _), g, t in zip(chain, proposals, values):
             if g is None:
                 ratios[n.node_id] = t
             else:
@@ -897,6 +1100,18 @@ class FinalizedTreeExecutor:
                 else torch.cat([r.token_ids for r in results])
             )
             tokens = token_ids.tolist()
+            if self.draft_confidence:
+                if any(r.confidence is None for r in results):
+                    raise RuntimeError("draft_confidence needs a drafter with a confidence head")
+                low = (torch.cat([r.confidence for r in results]) < self.draft_confidence).tolist()
+                kept, offset = [], 0
+                for size in sizes:
+                    block = low[offset : offset + size]
+                    keep = block.index(True) if True in block else size
+                    kept.append(tokens[offset : offset + keep])
+                    offset += size
+                self.stats["draft_slots_cut"] += sum(sizes) - sum(len(x) for x in kept)
+                tokens, sizes = [t for block in kept for t in block], [len(x) for x in kept]
             offset = 0
             for head, size in zip(plans, sizes):
                 parent = head
@@ -1025,6 +1240,7 @@ class FinalizedTreeExecutor:
             drafter_batches=0,
             drafter_calls=0,
             draft_slots=0,
+            draft_slots_cut=0,
             target_readout_calls=0,
             target_readout_rows=0,
             drafter_readout_rows=0,
@@ -1042,6 +1258,7 @@ class FinalizedTreeExecutor:
         )
         self.trace = []
         self.sampling_check = []
+        self.nucleus_calls = self.nucleus_sorts = 0
         _sync(self.runner.device)
         started = time.perf_counter()
         pref = self.runner.prefill(_token_ids_tensor(prompt_ids, self.runner.device))
@@ -1125,10 +1342,7 @@ class FinalizedTreeExecutor:
                 self.stats["target_readout_calls"] += 1
                 self.stats["target_readout_rows"] += len(rows)
                 if self.sampling:
-                    probs = self._readout_distributions(logits, [active[row].depth for row in rows])
-                    for i, row in enumerate(rows):
-                        node = active[row]
-                        node.dists[node.depth] = probs[i]
+                    self._readout(logits, [active[row] for row in rows])
                 else:
                     if argmax is None:
                         argmax = logits.argmax(-1)
@@ -1160,6 +1374,10 @@ class FinalizedTreeExecutor:
             )
         _sync(self.runner.device)
         finished = time.perf_counter()
+        if self.sampling and self.nucleus_width and self.top_p < 1:
+            # Calls whose target rows were cut from their most probable tokens, and those of them
+            # that went to the sort of the vocabulary.
+            self.stats.update(nucleus_calls=self.nucleus_calls, nucleus_sorts=self.nucleus_sorts)
         self.stats["S_count"] = (
             self.runner.R * (len(self.output) - 1) / max(self.stats["calls"], 1)
         )
@@ -1300,7 +1518,9 @@ def run_ouro_finalized(
         prewarm["scope"] = "once_per_rpc_before_measured_requests"
         drafter_prewarm = (
             adapter.prewarm_grid(k, *drafting_grid(runner.R, k))
-            if context_graph_grid and adapter is not None
+            # The padded grid reads the masks after the anchor; a DSpark drafter
+            # whose anchor slot predicts drafts on the layout path.
+            if context_graph_grid and adapter is not None and adapter.first_slot == 1
             else {"enabled": False}
         )
         for _ in range(warmup):

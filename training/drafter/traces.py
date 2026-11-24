@@ -52,10 +52,12 @@ from ..common.io import file_sha, locked, read_jsonl, read_jsonl_partial
 from ..sharekv.policy import NATIVE, POLICY_KEY, SHARED, checkpoint_policy, config_keys
 
 POOL_ORDER = ("dev", "eval", "train")
-# Ouro's two recommended settings; Nanbeige's (thinking) generation_config; Dory: the paper's sampling.
+# Ouro's two recommended settings; Nanbeige's (thinking) generation_config; Dory and Inkling2: the paper's
+# sampling (Inkling2's generation_config has temperature 1.0 and no nucleus).
 SAMPLING = {"ouro": [{"temperature": 1.0, "top_p": 0.7, "top_k": 0}, {"temperature": 0.6, "top_p": 0.95, "top_k": 0}],
             "nanbeige": [{"temperature": 0.6, "top_p": 0.95, "top_k": 20}],
-            "dory": [{"temperature": 0.6, "top_p": 0.95, "top_k": 0}]}
+            "dory": [{"temperature": 0.6, "top_p": 0.95, "top_k": 0}],
+            "inkling2": [{"temperature": 0.6, "top_p": 0.95, "top_k": 0}]}
 LOOP_WINDOW, LOOP_NGRAM, LOOP_MIN_UNIQUE, LOOP_STRIDE = 1024, 16, 0.5, 64
 # Upper bounds on concurrent requests; full-budget admission usually binds first.
 MAX_SEQS = {"ouro-1.4b-thinking": 64, "ouro-2.6b-thinking": 48, "nanbeige4.2-3b": 96, "dory1.0-4b": 64}
@@ -187,6 +189,8 @@ def compilation_config(family):
         from vllm.v1.spec_decode.twodsd import COMPILED
 
         return dict(COMPILED)
+    if family not in ("ouro", "nanbeige"):
+        raise NotImplementedError(f"The fork's engine cannot generate traces for family {family!r}")
     return dict(GRAPH_ONLY)
 
 
@@ -405,9 +409,9 @@ def worker(out, gpu, max_num_seqs, refill):
 
 
 def running_workers(out):
-    """GPUs whose worker of this queue still holds its lock."""
+    """Workers of this queue (GPUs, or the server clients of traces_remote) that still hold their lock."""
     busy = []
-    for path in sorted((queue_dir(out) / "workers").glob("gpu*.lock")):
+    for path in sorted((queue_dir(out) / "workers").glob("*.lock")):
         try:
             with held(path):
                 pass
@@ -469,7 +473,9 @@ def status(out):
                       "finished": by_pool}, indent=1))
 
 
-def collect(out, pools=None):
+def collect(out, pools=None, allow_missing=False):
+    """Write <pool>.jsonl in request order. allow_missing collects an unfinished queue (the traces that
+    exist, with the count of missing ones in the manifest) instead of raising."""
     out = Path(out)
     pools = pools or load_settings(out)["pools"]
     new = {r["id"]: r for path in sorted((out / "raw").glob("*.jsonl")) for r in read_jsonl_partial(path)}
@@ -478,12 +484,16 @@ def collect(out, pools=None):
     for name in pools:
         ids = [r["id"] for r in requests if r["pool"] == name]
         missing = [i for i in ids if i not in new]
-        if missing:
+        if missing and not allow_missing:
             raise RuntimeError(f"{name}: {len(missing)} requests have no finished trace")
+        ids = [i for i in ids if i in new]
+        if not ids:
+            continue
         rows = [{**new[i], "degenerate": is_degenerate(new[i]["output_ids"])} for i in ids]
         (out / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
         lengths = sorted(len(r["prompt_ids"]) + len(r["output_ids"]) for r in rows)
-        summary[name] = {"traces": len(rows), "sampled": sum(bool(r.get("sampling")) for r in rows),
+        summary[name] = {"traces": len(rows), "missing": len(missing),
+                         "sampled": sum(bool(r.get("sampling")) for r in rows),
                          "degenerate": sum(r["degenerate"] for r in rows),
                          "length_capped": sum(r["finish_reason"] == "length" for r in rows),
                          "loop_stopped": sum(r["finish_reason"] == "loop" for r in rows),
@@ -528,6 +538,7 @@ def main(argv=None):
     commands.add_parser("requeue", help="re-queue unfinished requests")
     collect_p = commands.add_parser("collect", help="write <pool>.jsonl and manifest.json")
     collect_p.add_argument("--pools", nargs="+", choices=POOL_ORDER)
+    collect_p.add_argument("--allow-missing", action="store_true", help="collect an unfinished queue")
     for sub in commands.choices.values():
         sub.add_argument("--out", type=Path, required=True, help="trace directory of one model and variant")
     args = parser.parse_args(argv)
@@ -552,7 +563,7 @@ def main(argv=None):
     elif args.command == "requeue":
         requeue(args.out)
     else:
-        collect(args.out, args.pools and [p for p in POOL_ORDER if p in args.pools])
+        collect(args.out, args.pools and [p for p in POOL_ORDER if p in args.pools], args.allow_missing)
 
 
 if __name__ == "__main__":

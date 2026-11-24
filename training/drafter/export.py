@@ -17,6 +17,18 @@ Dory: target_layer_ids index its unrolled input + R x recurrent + output path (t
 as target_head_scale.pt (logit_scale, initializer_range; read by the fork's qwen3_dflash.py when vLLM's
 DFlash proposer loads the export; the Dory 2DSD runner applies the target's own head scale), and mask_token_id is the reserved <SPECIAL_999> that also initialised the mask.
 
+Inkling 2: the export holds no copy of the target's head (the 2DSD runner supplies the target's own
+unembedding and softcap; the fork has no engine for a stock DFlash proposer to serve it). target_layer_ids
+are layer visits of the R-pass model, whose inputs are the features (Mini's feature layers 2, 7, 12, 17
+and 22 become [2, 31, 36, 41, 46] at R = 3); the visit count would stand for the final-norm state.
+
+A DSpark drafter (training.drafter.model) ships speculators' heads under their module names
+(markov_head.*, confidence_head.*) and describes them in loopedtf_drafter.dspark: the rank and type of the
+Markov head, and sample_from_anchor. block_size counts the slots of a block. By default they are the given
+token and block_size - 1 masks (sample_from_anchor false), as for DFlash. With sample_from_anchor the given
+token's slot drafts the first token, so block_size slots draft block_size tokens and 2DSD runs the export
+with blocks of up to block_size + 1 (the given token and the drafted ones).
+
   python -m training.drafter.export --checkpoint RUN/drafter/best.pt --out EXPORT [--target-path DIR] \\
       [--target-name ORG/NAME]
 """
@@ -31,6 +43,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from ..common import registry
+from ..common.io import file_sha
 from ..hf_models.dory.native import FEATURE_LAYERS as DORY_FEATURE_LAYERS
 from ..hf_models.dory.native import LOOPS as DORY_LOOPS
 from ..hf_models.dory.native import feature_layer_ids, unrolled_layers
@@ -83,6 +96,14 @@ def target_tensor(model_dir, name):
 
 def target_layout(target, ck):
     """(loops R, unrolled target layers, target_layer_ids) of the drafter's feature layers."""
+    if target.get("model_type") == registry.FAMILY_MODEL_TYPES["inkling2"]:
+        text = target["text_config"]
+        start, end = text["loop_config"]["core_start"], text["loop_config"]["core_end"]
+        R, layers = ck["target_loops"], text["num_hidden_layers"]
+        visits = layers + (R - 1) * (end - start)
+        ids = [layer if layer < start else visits if layer == layers else layer + (R - 1) * (end - start)
+               for layer in ck["feat_layers"]]
+        return R, visits, ids
     if target.get("model_type") == "dory":
         if tuple(ck["feat_layers"]) != DORY_FEATURE_LAYERS:
             raise ValueError(f"Dory drafters use the physical feature taps {DORY_FEATURE_LAYERS}")
@@ -107,7 +128,11 @@ def main(argv=None):
                                               "(default: as recorded at training, else configs/models.json)")
     parser.add_argument("--target-name", help="target identifier written to config.json, e.g. its HF repo id "
                                               "(default: the registry or HF id; required for a local target)")
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--allow-other-target", action="store_true",
+                        help="export against a target whose config.json is not the one the drafter was trained "
+                             "against (refused by default)")
+    parser.add_argument("--block-size", type=int, help="default: the block size of training (16 for older "
+                                                       "checkpoints)")
     parser.add_argument("--mask-token-id", type=int, help="override the dflash_config mask id")
     args = parser.parse_args(argv)
     ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -122,8 +147,20 @@ def main(argv=None):
         target_name = registry.label(path) if path else registry.label(ck["target"], variant)
     if target_name is None:
         parser.error("the target is a local directory; pass --target-name (e.g. its Hugging Face repo id)")
+    target_sha = file_sha(Path(model_dir) / "config.json")
+    if ck.get("target_config_sha256") not in (None, target_sha) and not args.allow_other_target:
+        parser.error(f"{model_dir} is not the target this drafter was trained against (another config.json): "
+                     "export against that checkpoint, or pass --allow-other-target")
     target = target_config(model_dir)
     dory = target.get("model_type") == "dory"
+    inkling2 = target.get("model_type") == registry.FAMILY_MODEL_TYPES["inkling2"]
+    if inkling2:  # the head's rows are the served vocabulary; the embedding table has spare rows after it
+        text = target["text_config"]
+        target = {**target, "vocab_size": text["vocab_size"], "served_vocab_size": text["unpadded_vocab_size"]}
+    block_size = args.block_size or ck.get("k_max", 16)
+    anchor_predicts = bool(ck.get("heads") and ck["heads"].get("sample_from_anchor"))
+    if anchor_predicts:  # trained on blocks of the given token and k_max - 1 drafted ones: k_max - 1 slots
+        block_size = args.block_size or block_size - 1
     R, num_target_layers, target_layer_ids = target_layout(target, ck)
     tokenizer = json.loads((model_dir / "tokenizer.json").read_text())
     names = {t["id"]: t["content"] for t in tokenizer["added_tokens"]}
@@ -138,17 +175,19 @@ def main(argv=None):
     rope_theta = cfg["rope_parameters"]["rope_theta"] if dory else target.get("rope_theta", 1e6)
     config = {
         "architectures": ["DFlashDraftModel"], "model_type": "qwen3", "attention_bias": False, "attention_dropout": 0.0,
-        "block_size": args.block_size, "dtype": "bfloat16", "hidden_act": "silu",
+        "block_size": block_size, "dtype": "bfloat16", "hidden_act": "silu",
         "hidden_size": cfg["hidden_size"], "intermediate_size": cfg["intermediate_size"], "head_dim": cfg["head_dim"],
         "num_attention_heads": cfg["num_attention_heads"], "num_key_value_heads": cfg["num_key_value_heads"],
         "num_hidden_layers": cfg["num_hidden_layers"], "layer_types": ["full_attention"] * cfg["num_hidden_layers"],
         "max_position_embeddings": target.get("max_position_embeddings", 65536), "max_window_layers": cfg["num_hidden_layers"],
         "rms_norm_eps": cfg["rms_norm_eps"], "rope_theta": rope_theta, "rope_scaling": None,
         "sliding_window": None, "use_sliding_window": False, "tie_word_embeddings": False, "use_cache": True,
-        "vocab_size": target["vocab_size"], "bos_token_id": target.get("bos_token_id"), "eos_token_id": target.get("eos_token_id"),
+        "vocab_size": target.get("served_vocab_size", target["vocab_size"]),
+        "bos_token_id": target.get("bos_token_id"), "eos_token_id": target.get("eos_token_id"),
         "num_target_layers": num_target_layers,
         "dflash_config": {"mask_token_id": mask_token_id, "target_layer_ids": target_layer_ids},
         "loopedtf_drafter": {"target": ck["target"], "target_variant": variant, "target_checkpoint": target_name,
+                             "target_config_sha256": target_sha,
                              "step": ck["step"], "anchor_depth_weights": ck["d_weights"],
                              "feature_layers_per_loop": ck["feat_layers"], "target_loops": R,
                              "input_format": INPUT_FORMAT,
@@ -156,9 +195,18 @@ def main(argv=None):
     }
     if dory:
         config["loopedtf_drafter"]["target_head"] = {"kind": "dory-scaled", "scale_file": "target_head_scale.pt"}
+    if inkling2:
+        config["loopedtf_drafter"]["target_head"] = {"kind": "inkling2-shared",
+                                                     "softcap": target["text_config"]["final_logit_softcapping"]}
+    if ck.get("heads"):
+        config["loopedtf_drafter"]["dspark"] = {"markov_rank": ck["heads"]["rank"],
+                                                "markov_head_type": ck["heads"]["type"],
+                                                "confidence_head_with_markov": True,
+                                                "sample_from_anchor": anchor_predicts}
     state = {k: v.to(torch.bfloat16).contiguous() for k, v in ck["model"].items()
              if not k.startswith("rotary.") and k != "mask_emb"}
-    state["lm_head.weight"] = target_tensor(model_dir, "lm_head.weight").to(torch.bfloat16).contiguous()
+    if not inkling2:
+        state["lm_head.weight"] = target_tensor(model_dir, "lm_head.weight").to(torch.bfloat16).contiguous()
     args.out.mkdir(parents=True, exist_ok=True)
     save_file(state, args.out / "model.safetensors")
     if dory:  # kept apart from the BF16 weights so that it is applied in FP32 after the GEMM

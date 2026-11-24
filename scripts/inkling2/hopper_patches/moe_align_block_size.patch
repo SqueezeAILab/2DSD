@@ -1,0 +1,66 @@
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -10,6 +10,54 @@
+ from vllm.utils.math_utils import round_up
+ 
+ 
++
++def _torch_moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids, expert_ids,
++                                num_tokens_post_pad, expert_map, scatter_idx):
++    """Pod patch: static-shape PyTorch equivalent of ops.moe_align_block_size for Hopper.
++
++    This image's _moe_C ships the large-batch align kernel for SM10x only (no sm_90 SASS or
++    PTX). No host sync, so it stays capturable in CUDA graphs. Ignored routes (invalid ids, or
++    -1 under expert_map) take no slot; within an expert, routes keep their flat order.
++    """
++    flat = topk_ids.reshape(-1).to(torch.int64)
++    numel = flat.numel()
++    device = flat.device
++    if expert_map is not None:
++        in_range = (flat >= 0) & (flat < expert_map.numel())
++        local = expert_map.to(torch.int64)[flat.clamp(0, expert_map.numel() - 1)]
++        valid = in_range & (local >= 0)
++        experts = torch.where(valid, local, num_experts)
++    else:
++        valid = (flat >= 0) & (flat < num_experts)
++        experts = torch.where(valid, flat, num_experts)
++    counts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
++    counts.scatter_add_(0, experts, torch.ones_like(experts))
++    padded = (counts[:num_experts] + block_size - 1) // block_size * block_size
++    block_ends = torch.cumsum(padded // block_size, 0)
++    starts = torch.cumsum(padded, 0) - padded
++    route_starts = torch.cumsum(counts, 0) - counts
++    order = torch.argsort(experts, stable=True)
++    sorted_experts = experts[order]
++    rank = torch.arange(numel, device=device) - route_starts[sorted_experts]
++    slot = starts[sorted_experts.clamp(max=num_experts - 1)] + rank
++    capacity = sorted_ids.numel()
++    slot = torch.where(sorted_experts < num_experts, slot, capacity)
++    staging = torch.full((capacity + 1,), numel, dtype=torch.int32, device=device)
++    staging.scatter_(0, slot, order.to(torch.int32))
++    sorted_ids.copy_(staging[:capacity])
++    blocks = torch.arange(expert_ids.numel(), device=device)
++    expert_ids.copy_(torch.searchsorted(block_ends, blocks, right=True).clamp(max=num_experts - 1).to(torch.int32))
++    num_tokens_post_pad.copy_(padded.sum().reshape(1).to(torch.int32))
++    if scatter_idx is not None:
++        rows = torch.arange(numel, device=device, dtype=torch.int32)
++        scatter_idx.copy_(torch.where(valid, rows, -1).reshape(-1, 1))
++
++
++def _align_op():
++    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
++        return _torch_moe_align_block_size
++    return ops.moe_align_block_size
++
+ @overload
+ def moe_align_block_size(
+     topk_ids: torch.Tensor,
+@@ -150,7 +198,7 @@
+     )
+     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+ 
+-    ops.moe_align_block_size(
++    _align_op()(
+         topk_ids,
+         num_experts,
+         block_size,

@@ -1,0 +1,23 @@
+{
+  "_comment": "DSpark drafter for the variable-loop checkpoint inkling-2-mini-varloop (thinkingmachines/TML-d24-varloop-research, R = 3 passes, per-pass KV). The recipe is that of configs/drafter/inkling-2-mini.json; the target, its traces and the drafter are this model's own (a drafter trained on Inkling-2-Mini's features is not this model's drafter). Pass --traces, --out; --micro-blocks 128 on an 80 GB card.",
+  "model": "inkling-2-mini-varloop",
+  "target": "original",
+  "drafter": [
+    "dspark:5:1=0.5,2=0.25,3=0.25:dspark"
+  ],
+  "markov_head": "vanilla",
+  "markov_rank": 256,
+  "k_max": 8,
+  "blocks": 1024,
+  "micro_blocks": 256,
+  "seq_len": 16384,
+  "epochs": 10,
+  "reuse": 2,
+  "lr": 0.0006,
+  "muon_lr": 0.003,
+  "warmup": 0.04,
+  "eval_docs": 240,
+  "eval_stride": 48,
+  "log_every": 20,
+  "seed": 0
+}

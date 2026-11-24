@@ -34,12 +34,17 @@ def oracle_next(tokens, causal=False, loops=4):
 
 
 class FakeTreeRunner:
-    """Exact recurrent target with isolated node KV and strict pool operations."""
+    """Exact recurrent target with isolated node KV and strict pool operations.
 
-    R, H, nf, max_len = 4, 1, 1, 512
+    ``loops`` is the loop count R of the target: 4 by default (Ouro, Dory), 3 for
+    Inkling2 and 2 for Nanbeige. ``oracle_next(..., loops=R)`` is its greedy AR.
+    """
+
+    H, nf, max_len = 1, 1, 512
     device, dtype = torch.device("cpu"), torch.float64
 
-    def __init__(self, max_nodes=64, causal=True):
+    def __init__(self, max_nodes=64, causal=True, loops=4):
+        self.R = loops
         self.max_nodes, self.causal = max_nodes, causal
         self.stats = {
             "calls": 0,
@@ -47,6 +52,7 @@ class FakeTreeRunner:
             "registered_nodes": 0,
             "committed_nodes": 0,
             "released_nodes": 0,
+            "longest_path": 0,  # in-flight tokens from the cursor to a candidate
         }
         self.registrations = []
         self.release_roots = []
@@ -112,6 +118,10 @@ class FakeTreeRunner:
             raise AssertionError("The scheduler allocated beyond its node budget")
         if parent_id is not None and parent_id not in self.nodes:
             raise AssertionError("Candidate lost an unverified ancestor")
+        path = 1 if parent_id is None else len(self.path(parent_id)) + 1
+        if self.prefix_length + path > self.max_len:
+            raise AssertionError("A candidate lies beyond the context capacity")
+        self.stats["longest_path"] = max(self.stats["longest_path"], path)
         self.nodes[node_id] = {
             "parent": parent_id,
             "token": token_id,
@@ -216,6 +226,111 @@ class FakeTreeRunner:
                 node["parent"] = None
             self.keys[node["parent"], node["token"]] = node_id
         self.stats["committed_nodes"] += len(ids)
+
+
+class FusedReadoutRunner:
+    """A fake runner whose depth-d logits come out of the target call.
+
+    This is the fused-readout protocol of the dense Dory runner, for targets
+    with an input block, a looped block and an output block (the layout of
+    Inkling2): the scheduler takes logits from the call, at the schedule's
+    readout depths only, and never applies the head to a node's hidden state.
+    Everything else is the wrapped span-protocol fake's.
+    """
+
+    fused_readout = True
+
+    def __init__(self, runner, readout_depths):
+        self.runner, self.readout_depths = runner, frozenset(readout_depths)
+
+    @classmethod
+    def for_schedule(cls, runner, stage, d1=1, d2=2):
+        """Read out at the depths of a schedule, as the executor requires."""
+        depths = {d1} if stage == "stage1" else {d1, d2}
+        return cls(runner, depths | {runner.R})
+
+    def __getattr__(self, name):
+        return getattr(self.runner, name)
+
+    def advance(self, spans):
+        raise AssertionError("Fused readouts come from advance_readout")
+
+    def advance_readout(self, spans):
+        results = self.runner.advance(spans)
+        rows = [i for i, s in enumerate(spans) if s.loop + 1 in self.readout_depths]
+        logits = None
+        if rows:
+            logits = self.runner.logits(torch.cat([results[i].hidden for i in rows]))
+        return results, logits, [spans[i].node_id for i in rows]
+
+
+class NodeStateRunner(FusedReadoutRunner):
+    """A fused-readout fake that also keeps every node's state and features.
+
+    This is the node-state protocol of Dory's graph runner: the scheduler passes
+    node ids and loops and never holds a hidden state; features are read from
+    the runner where a draft or a commit needs them, and exist only at readout
+    depths. The argmax and logits of a call are graph outputs, overwritten by
+    the next call.
+    """
+
+    keeps_node_state = True
+
+    def __init__(self, runner, readout_depths):
+        super().__init__(runner, readout_depths)
+        self.hidden, self.features, self.outputs = {}, {}, ()
+
+    def register(self, node_id, parent_id, token_id):
+        raise AssertionError("Node state is registered with register_many")
+
+    def reset(self):
+        self.runner.reset()
+        self.hidden, self.features, self.outputs = {}, {}, ()
+
+    def register_many(self, nodes):
+        for node_id, parent_id, token_id in nodes:
+            if node_id in self.hidden:
+                raise AssertionError("A node is registered once")
+            self.runner.register(node_id, parent_id, token_id)
+            self.hidden[node_id] = self.runner.embed(torch.tensor([token_id]))[0]
+            self.features[node_id] = {}
+
+    def advance_nodes(self, node_ids, loops):
+        for stale in self.outputs:
+            stale.fill_(-1)
+        spans = [
+            SimpleNamespace(node_id=node_id, loop=loop, hidden=self.hidden[node_id])
+            for node_id, loop in zip(node_ids, loops)
+        ]
+        results, logits, _ = self.advance_readout(spans)
+        rows = []
+        for row, (span, result) in enumerate(zip(spans, results)):
+            self.hidden[span.node_id] = result.hidden[0]
+            if span.loop + 1 in self.readout_depths:
+                self.features[span.node_id][span.loop + 1] = result.features[0]
+                rows.append(row)
+        argmax = None if logits is None else logits.argmax(-1)
+        self.outputs = () if logits is None else (argmax, logits)
+        return rows, argmax, logits
+
+    def span_features(self, spans):
+        return tuple(
+            torch.stack([self.features[node_id][depth] for node_id in node_ids])
+            for depth, node_ids in spans
+        )
+
+    def release(self, node_ids):
+        self.runner.release(node_ids)
+        for node_id in node_ids:
+            del self.hidden[node_id], self.features[node_id]
+
+    def commit(self, node_ids, features=None):
+        if features is not None:
+            final = [self.features[node_id][self.runner.R] for node_id in node_ids]
+            torch.stack(final, out=features)
+        self.runner.commit(node_ids)
+        for node_id in node_ids:
+            del self.hidden[node_id], self.features[node_id]
 
 
 class _Norm(nn.Module):

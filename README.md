@@ -17,6 +17,7 @@
 
 ## Updates
 
+- Nov 23, 2026: Inkling-2-Mini (variable-loop) and DSpark drafters supported.
 - Nov 19, 2026: Code, shared-KV targets and drafters released.
 
 ## Overview
@@ -122,6 +123,25 @@ Use the same commands with any supported `--model`.
 - The paper's main tables exclude capped responses whose final 2048 tokens have fewer than half distinct 16-grams
   (the repetition-filtered column).
 
+## Inkling 2
+
+We support the variable-loop checkpoint of [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
+[TML-d24-varloop-research](https://huggingface.co/thinkingmachines/TML-d24-varloop-research)
+(`inkling-2-mini-varloop`), with its
+[DSpark drafter](https://huggingface.co/minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter):
+
+```bash
+# Packed expert kernels of the default path (the locked environment has an older Humming).
+uv pip install --target humming-0.1.20 --no-deps humming-kernels==0.1.20
+
+python scripts/build_prompts.py --model inkling-2-mini-varloop --suite core --out prompts/inkling-varloop
+python scripts/benchmark.py --model inkling-2-mini-varloop --humming humming-0.1.20 \
+    --prompts prompts/inkling-varloop/core.prompts.jsonl --out runs/inkling-varloop-core-2dsd.jsonl
+python scripts/benchmark.py --method ar --model inkling-2-mini-varloop --humming humming-0.1.20 \
+    --prompts prompts/inkling-varloop/core.prompts.jsonl --out runs/inkling-varloop-core-ar.jsonl
+python scripts/benchmark.py --summarize runs/inkling-varloop-core-2dsd.jsonl runs/inkling-varloop-core-ar.jsonl
+```
+
 ## Training
 
 See [`training/README.md`](training/README.md) for both recipes:
@@ -130,12 +150,13 @@ See [`training/README.md`](training/README.md) for both recipes:
   on four H100 GPUs per model (Ouro and Nanbeige; Dory1.0-4B shares without adaptation).
 - **Depth-conditioned DFlash drafter** (App. D.4): target rollouts on 13K prompts, then six epochs of DFlash
   training across loop depths, for all four models.
+- **DSpark drafter**: the same pipeline with the `dspark` recipe, used for Inkling 2.
 
 ## Repository contents
 
 | Path | Contents |
 |---|---|
-| `vllm-fork/` | vLLM v0.26.0 with the 2DSD executor and last-loop KV sharing for Ouro, Nanbeige and Dory |
+| `vllm-fork/` | vLLM v0.26.0 with the 2DSD executor, last-loop KV sharing for Ouro, Nanbeige and Dory, and the Inkling 2 runner |
 | `training/kd/`, `training/sharekv/` | Shared-KV adaptation by two-pass self-distillation (App. C) |
 | `training/drafter/` | Depth-conditioned DFlash drafter: prompt pool, target rollouts, training, export (App. D.4) |
 | `training/hf_models/` | Transformers ports of Ouro and Nanbeige and a plain PyTorch implementation of Dory1.0-4B, used in training |

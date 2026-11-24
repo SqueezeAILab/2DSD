@@ -1,5 +1,5 @@
 {
-  "_comment": "Hugging Face repositories of each registry name. repo_id is the base model, pinned to the revision of the paper's numbers because its main branch can change the chat template or remote code; w64 is the shared-KV (W = 64) target and drafters hold the drafter of each target. Dory shares without adaptation: both of its targets are the pinned base checkpoint with configuration overrides (loops 4, kv_policy w64 or native), so it has no w64 repository, and one drafter serves both.",
+  "_comment": "Hugging Face repositories of each registry name. repo_id is the base model, pinned to the revision of the paper's numbers because its main branch can change the chat template or remote code; w64 is the shared-KV (W = 64) target and drafters hold the drafter of each target. Dory shares without adaptation: both of its targets are the pinned base checkpoint with configuration overrides (loops 4, kv_policy w64 or native), so it has no w64 repository, and one drafter serves both. dspark_drafters hold a model's DSpark drafters, which run when a model has no other drafter or with --drafter-kind dspark. Inkling-2-Mini runs per-loop KV only (no KV sharing, so w64 is null) and has no drafter yet: pass a drafter explicitly or run block size one. inkling-2-mini-varloop is the variable-loop checkpoint of the same architecture, tokenizer and chat template (its early passes are trained to read out), with its own DSpark drafter; it is a separate model: its traces, drafters and results are never mixed with Inkling-2-Mini's.",
   "models": {
     "ouro-1.4b-thinking": {
       "repo_id": "ByteDance/Ouro-1.4B-Thinking",
@@ -43,6 +43,25 @@
       "drafters": {
         "w64": "minseo25/2dsd-dory1.0-4b-dflash-drafter",
         "original": "minseo25/2dsd-dory1.0-4b-dflash-drafter"
+      }
+    },
+    "inkling-2-mini": {
+      "repo_id": "thinkingmachines/Inkling-2-Mini",
+      "revision": "1fb4134b9a74f9681054f4ef82e4bf1f458a2337",
+      "family": "inkling2",
+      "loops": 3,
+      "w64": null,
+      "drafters": {}
+    },
+    "inkling-2-mini-varloop": {
+      "repo_id": "thinkingmachines/TML-d24-varloop-research",
+      "revision": "657b53ba5da7baefe9ff15dca5cd25f5bd3dbaa2",
+      "family": "inkling2",
+      "loops": 3,
+      "w64": null,
+      "drafters": {},
+      "dspark_drafters": {
+        "original": "minseo25/2dsd-inkling-2-mini-varloop-dspark-drafter"
       }
     }
   }

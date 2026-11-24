@@ -77,7 +77,8 @@ class Resolution(unittest.TestCase):
                          dict(pinned, revision="abc", drafter="me/d@1"))
         self.assertEqual(resolved("--model", "dory1.0-4b", "--kv-policy", "native"),
                          resolved("--model", "dory1.0-4b", "--target", "original"))
-        self.assertIn("applies to Dory only", rejected("--model", "ouro-2.6b-thinking", "--kv-policy", "w64"))
+        self.assertIn("applies to Dory only",
+                      rejected("--model", "ouro-2.6b-thinking", "--kv-policy", "w64"))
 
     def test_a_model_outside_the_registry_runs_as_given(self):
         self.assertEqual(resolved("--model", "org/looped", "--drafter", "org/drafter@1", "--revision", "r"),
@@ -91,11 +92,29 @@ class Resolution(unittest.TestCase):
         self.assertIn("--target applies to registry names",
                       rejected("--model", "ByteDance/Ouro-1.4B-Thinking", "--target", "original", "--drafter", "d"))
 
+    def test_inkling2_runs_its_pinned_checkpoint_without_sharing(self):
+        """inkling-2-mini runs per-loop KV (the original target) and has no registry drafter; the shared
+        target and policy are refused."""
+        entry = MODELS["inkling-2-mini"]
+        expected = {"model": entry["repo_id"], "revision": entry["revision"], "drafter": None,
+                    "kv_policy": "native"}
+        self.assertEqual(expected["revision"], "1fb4134b9a74f9681054f4ef82e4bf1f458a2337")
+        self.assertEqual(resolved("--model", "inkling-2-mini", "--block-size", "1"), expected)
+        self.assertEqual(resolved("--model", "inkling-2-mini", "--target", "original", "--drafter", "me/d@1"),
+                         dict(expected, drafter="me/d@1"))
+        self.assertEqual(resolved("--model", "inkling-2-mini", "--block-size", "1", "--kv-policy", "native"), expected)
+        self.assertIn("inkling-2-mini has no published drafter", rejected("--model", "inkling-2-mini"))
+        for extra in (("--target", "w64"), ("--kv-policy", "w64")):
+            with self.subTest(extra=extra):
+                self.assertIn("per-loop KV only", rejected("--model", "inkling-2-mini", "--block-size", "1", *extra))
+
 
 class Main(unittest.TestCase):
     def run_main(self, *argv, model_type):
-        """generate.main with a fake TwoDSD; returns (engine options, rendered chats, stdout, stderr)."""
-        built, chats = [], []
+        """generate.main with a fake TwoDSD; returns (engine options, rendered chats, stdout, stderr) and
+        keeps the options of the generate call in self.generated."""
+        built, chats, self.generated = [], [], []
+        generated = self.generated
 
         class TwoDSD:
             def __init__(self, model, drafter, **options):
@@ -111,15 +130,28 @@ class Main(unittest.TestCase):
                                                  decode=lambda ids, skip_special_tokens: "answer")
 
             def generate(self, prompts, **options):
+                generated.append({**options, "prompts": prompts})
                 return [{"output_ids": [7] * 5, "decode_seconds": 2.0, "stats": {"calls": 2}}]
+
+        def render_inkling2(tokenizer, messages):  # the shared Inkling2 renderer: (text, token IDs)
+            chats.append((messages, "render_inkling2"))
+            return "rendered", [8, 9]
 
         twodsd = types.ModuleType("vllm.v1.spec_decode.twodsd")
         twodsd.TwoDSD = TwoDSD
         out, err = io.StringIO(), io.StringIO()
-        with (patch.dict(sys.modules, {"vllm.v1.spec_decode.twodsd": twodsd}), redirect_stdout(out),
+        with (patch.dict(sys.modules, {"vllm.v1.spec_decode.twodsd": twodsd}),
+              patch.object(generate, "render_inkling2", render_inkling2), redirect_stdout(out),
               redirect_stderr(err)):
             generate.main([*argv, "--prompt", "hi"])
         return built, chats, out.getvalue(), err.getvalue()
+
+    def test_a_humming_directory_comes_first_on_the_import_path(self):
+        """--humming DIR: the engine imports Humming (Inkling2's packed experts) from that directory."""
+        with patch.object(sys, "path", list(sys.path)):
+            self.run_main("--model", "inkling-2-mini", "--block-size", "1", "--humming", "/opt/humming",
+                          model_type="inkling2_loop")
+            self.assertEqual(sys.path[0], "/opt/humming")
 
     def test_the_engine_gets_the_resolved_arguments(self):
         built, _, out, err = self.run_main("--model", "dory1.0-4b", "--target", "original", model_type="dory")
@@ -151,6 +183,32 @@ class Main(unittest.TestCase):
             with self.subTest(argv=argv):
                 _, chats, _, _ = self.run_main(*argv, model_type=model_type)
                 self.assertEqual(chats, [(messages, {"tokenize": False, "add_generation_prompt": True})])
+
+    def test_inkling2_generates_with_its_fixed_eos_ids(self):
+        """The engine reports model_type inkling2_loop, the family is inkling2: EOS [200006] is passed
+        explicitly, there is no system turn, and the KV policy is reported as native (per-loop KV)."""
+        _, chats, _, err = self.run_main("--model", "inkling-2-mini", "--block-size", "1", model_type="inkling2_loop")
+        self.assertEqual(self.generated[0]["eos_token_ids"], [200006])
+        # The token IDs are those of the renderer of the benchmark prompts, which encodes a message as text
+        # (a tokenizer run over the rendered string reads a spelled-out framing token as the token).
+        self.assertEqual(chats, [([{"role": "user", "content": "hi"}], "render_inkling2")])
+        self.assertEqual(self.generated[0]["prompts"], [[8, 9]])
+        self.assertIn("kv_policy native", err)
+        # A checkpoint outside the registry is Inkling2 by the engine's model_type.
+        self.run_main("--model", "/ckpt/inkling", "--drafter", "d", model_type="inkling2_loop")
+        self.assertEqual(self.generated[0]["eos_token_ids"], [200006])
+        # The other families leave EOS to the engine, which reads their checkpoints.
+        for argv, model_type in ((("--model", "ouro-2.6b-thinking"), "ouro"), (("--model", "dory1.0-4b"), "dory"),
+                                 (("--model", "nanbeige4.2-3b"), "nanbeige")):
+            with self.subTest(argv=argv):
+                self.run_main(*argv, model_type=model_type)
+                self.assertIsNone(self.generated[0]["eos_token_ids"])
+
+    def test_an_engine_of_an_unknown_model_type_is_an_error(self):
+        """Guards the family lookup: no model_type is rendered or stopped as another family."""
+        with self.assertRaisesRegex(ValueError, "unsupported model_type 'qwen3'"):
+            self.run_main("--model", "org/dense", "--drafter", "d", model_type="qwen3")
+        self.assertEqual(self.generated, [])
 
 
 if __name__ == "__main__":

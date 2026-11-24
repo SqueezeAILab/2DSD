@@ -13,23 +13,36 @@ template of the pinned model revision in configs/models.json.
 
 usage: build_prompts.py --model MODEL --suite {core,hard} --out DIR
                         [--cache-dir DIR] [--include aime26] [--offline]
+                        [--reasoning-effort LEVEL]
 
 Writes DIR/SUITE.prompts.jsonl, one question per line sorted by id with the fields
 id, benchmark, source, domain, problem_id, request_id, rendered_family, max_total_tokens,
 prompt_tokens and prompt_ids, and DIR/SUITE.manifest.json. No benchmark text, answer or
-reference solution is written. Manifest hashes:
+reference solution is written.
+
+Manifest hashes:
   catalog_sha256  SHA-256 of the catalog serialization used for the paper's runs. Those
                   rows also carry the task text and the reference answer, which this script
-                  computes in memory only. Equal to configs/benchmarks.json reference_catalogs
+                  keeps in memory.
+                  Equal to configs/benchmarks.json reference_catalogs
                   when the prompts, IDs and budgets are the paper's.
   prompt_digest   SHA-256 of the JSON list [[id, prompt_ids], ...]; recomputable from the
                   prompts file.
   prompts_sha256  SHA-256 of the written prompts file.
 The exit status is 1 when a reference exists and either hash differs from it.
 
+Inkling-2-Mini (family inkling2) is not one of the paper's models, so its catalogs have no
+reference. Its chat template has no thinking switch and no generation prompt: a prompt carries the
+thinking effort of --reasoning-effort (a level name none, minimal, low, medium, high, xhigh or max,
+or a number in [0, 0.99]; default 0.9, the template's default; written to the manifest as
+reasoning_effort) and ends with the user turn, and message text is encoded as the official renderer
+encodes it (training.common.chat.render_inkling2). The code prompts keep the EvalPlus assistant
+prefix, which opens the model's text block: the model answers them without a thinking block.
+
 GPQA-Diamond is gated on Hugging Face: accept its terms on the dataset page and
 authenticate (HF_TOKEN or `hf auth login`) before building the hard suite.
-Dependencies: transformers, huggingface_hub, pyarrow (and the standard library).
+Dependencies: transformers, huggingface_hub, pyarrow (and the standard library), and
+training.common.chat of this repository.
 """
 from __future__ import annotations
 
@@ -49,6 +62,10 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # training.common.chat renders the Inkling2 prompts
+from training.common import chat  # noqa: E402
+
 BENCHMARKS_CONFIG = ROOT / "configs" / "benchmarks.json"
 MODELS_CONFIG = ROOT / "configs" / "models.json"
 
@@ -68,6 +85,8 @@ SYSTEM_PROMPTS = {
     "nanbeige": ("You are Nanbeige, a professional large language model independently developed "
                  "and trained by BOSS Zhipin."),
 }
+# Inkling2 is not listed: its template takes neither a thinking switch nor a generation prompt
+# (render_inkling2_prompt).
 TEMPLATE_KWARGS = {"ouro": {}, "nanbeige": {"enable_thinking": True}, "dory": {"enable_thinking": True}}
 # Files fetched from the model repository; weights are never downloaded.
 TOKENIZER_PATTERNS = ["tokenizer*", "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt",
@@ -182,8 +201,13 @@ def split_assistant_prefix(rendered, splitter=EVALPLUS_SPLITTER):
     return rendered.split(splitter)[0]
 
 
+def evalplus_turns(task):
+    """User turn and assistant prefix of the EvalPlus raw-chat prompt; the model's code follows the prefix."""
+    return f"{EVALPLUS_INSTRUCTION}\n```\n{task.strip()}\n```\n", f"{EVALPLUS_RESPONSE}\n```python\n"
+
+
 def render_prompt(apply_chat_template, family, task, mode):
-    """Prompt text in the family's native chat template.
+    """Prompt text in the family's native chat template (Inkling2: render_inkling2_prompt).
 
     user_chat: one user turn and the generation prompt. evalplus_chat: the EvalPlus raw-chat
     prompt, whose assistant turn is prefilled up to the opening of a Python code block.
@@ -192,8 +216,8 @@ def render_prompt(apply_chat_template, family, task, mode):
         raise ValueError(f"Unsupported model family: {family}")
     kwargs = TEMPLATE_KWARGS[family]
     if mode == "evalplus_chat":
-        user = f"{EVALPLUS_INSTRUCTION}\n```\n{task.strip()}\n```\n"
-        assistant = f"{EVALPLUS_RESPONSE}\n```python\n{EVALPLUS_SPLITTER}\n```\n"
+        user, prefix = evalplus_turns(task)
+        assistant = f"{prefix}{EVALPLUS_SPLITTER}\n```\n"
         messages = [*system_messages(family), {"role": "user", "content": user},
                     {"role": "assistant", "content": assistant}]
         return split_assistant_prefix(apply_chat_template(messages, tokenize=False, **kwargs))
@@ -203,8 +227,41 @@ def render_prompt(apply_chat_template, family, task, mode):
     raise ValueError(f"Unknown prompt mode: {mode}")
 
 
+def render_inkling2_prompt(tokenizer, task, mode, effort=None):
+    """(prompt text, prompt token IDs) of an Inkling2 prompt at a thinking effort (None: 0.9).
+
+    user_chat: one user turn. The template has no generation prompt, so the prompt ends with that
+    turn and the model opens its own. evalplus_chat: the EvalPlus raw-chat prompt, whose assistant
+    prefix is the open start of the model's text block (the official continue_final_message).
+    """
+    if mode == "evalplus_chat":
+        user, prefix = evalplus_turns(task)
+        messages = [{"role": "user", "content": user}, {"role": "assistant", "content": prefix}]
+    elif mode == "user_chat":
+        messages = [{"role": "user", "content": task}]
+    else:
+        raise ValueError(f"Unknown prompt mode: {mode}")
+    return chat.render_inkling2(tokenizer, [*system_messages("inkling2"), *messages], effort,
+                                continue_final=mode == "evalplus_chat")
+
+
+def prompt_renderer(tokenizer, family, effort=None):
+    """render(task, mode) -> (prompt text, prompt token IDs) in the family's chat protocol; `effort` is
+    Inkling2's thinking effort."""
+    if family == "inkling2":
+        return lambda task, mode: render_inkling2_prompt(tokenizer, task, mode, effort)
+    if family not in TEMPLATE_KWARGS:
+        raise ValueError(f"Unsupported model family: {family}")
+
+    def render(task, mode):
+        prompt = render_prompt(tokenizer.apply_chat_template, family, task, mode)
+        return prompt, list(tokenizer.encode(prompt, add_special_tokens=False))
+
+    return render
+
+
 def catalog_row(*, benchmark, problem_id, domain, task, target, prompt, ids, family, budget, extra=None):
-    """A row of the reference catalog. Only PUBLIC_FIELDS of it are ever written."""
+    """A row of the reference catalog. Only PUBLIC_FIELDS of it are written to the prompts file."""
     if not 0 <= len(ids) < budget:
         raise IntegrityError(f"{benchmark}/{problem_id}: the prompt exhausts the {budget}-token budget")
     return {"problem_id": problem_id, "sample_id": 0, "target": target, "task_prompt": task,
@@ -305,7 +362,7 @@ def source_entry(pin, **extra):
 
 # Suites
 
-def build_core(config, encode, apply_chat_template, family, cache_dir, offline):
+def build_core(config, render, family, cache_dir, offline):
     suite = config["suites"]["core"]
     budget = suite["max_total_tokens"]
     excluded = {(entry["benchmark"], entry["problem_id"]) for entry in suite["excluded_questions"]}
@@ -325,12 +382,12 @@ def build_core(config, encode, apply_chat_template, family, cache_dir, offline):
                 continue
             task, target = core_task(name, row)
             mode = "evalplus_chat" if pin["domain"] == "code" else "user_chat"
-            prompt = render_prompt(apply_chat_template, family, task, mode)
+            prompt, ids = render(task, mode)
             extra = {"native_id": native, "prompt_mode": mode}
             if pin["domain"] == "code":
                 extra["entry_point"] = row["entry_point"]
             rows.append(catalog_row(benchmark=name, problem_id=problem_id, domain=pin["domain"], task=task,
-                                    target=target, prompt=prompt, ids=encode(prompt), family=family,
+                                    target=target, prompt=prompt, ids=ids, family=family,
                                     budget=budget, extra=extra))
             kept += 1
         if len(set(identities)) != len(identities):
@@ -342,7 +399,7 @@ def build_core(config, encode, apply_chat_template, family, cache_dir, offline):
     return rows, sources, selection, budget
 
 
-def build_hard(config, encode, apply_chat_template, family, cache_dir, offline, include=()):
+def build_hard(config, render, family, cache_dir, offline, include=()):
     suite = config["suites"]["hard"]
     budget = suite["max_total_tokens"]
     unknown = set(include) - set(suite["optional_benchmarks"])
@@ -365,9 +422,9 @@ def build_hard(config, encode, apply_chat_template, family, cache_dir, offline, 
             if identifier not in chosen:
                 continue
             task, target = hard_task(name, row, identifier)
-            prompt = render_prompt(apply_chat_template, family, task, "user_chat")
+            prompt, ids = render(task, "user_chat")
             rows.append(catalog_row(benchmark=name, problem_id=identifier, domain=pin["domain"], task=task,
-                                    target=target, prompt=prompt, ids=encode(prompt), family=family,
+                                    target=target, prompt=prompt, ids=ids, family=family,
                                     budget=budget))
     selection = {"complete": [name for name in names if name not in suite["subsets"]],
                  "subsets": {name: suite["subsets"][name] for name in names if name in suite["subsets"]},
@@ -430,7 +487,8 @@ def write_atomic(path, content):
         temporary.unlink(missing_ok=True)
 
 
-def build(model_name, suite, out, cache_dir, include=(), offline=False, config=None, models=None):
+def build(model_name, suite, out, cache_dir, include=(), offline=False, config=None, models=None,
+          reasoning_effort=None):
     config = config or json.loads(BENCHMARKS_CONFIG.read_text())
     models = models or json.loads(MODELS_CONFIG.read_text())["models"]
     if model_name not in models:
@@ -439,12 +497,13 @@ def build(model_name, suite, out, cache_dir, include=(), offline=False, config=N
         raise ValueError("--include applies to the hard suite only")
     model = models[model_name]
     family = model["family"]
+    effort = None
+    if family == "inkling2":
+        effort = chat.inkling2_effort(reasoning_effort)
+    elif reasoning_effort is not None:
+        raise ValueError(f"--reasoning-effort applies to the inkling2 family, not to {model_name}")
     tokenizer, tokenizer_files = load_tokenizer(model, offline)
-
-    def encode(prompt):
-        return list(tokenizer.encode(prompt, add_special_tokens=False))
-
-    arguments = (config, encode, tokenizer.apply_chat_template, family, cache_dir, offline)
+    arguments = (config, prompt_renderer(tokenizer, family, effort), family, cache_dir, offline)
     if suite == "core":
         rows, sources, selection, budget = build_core(*arguments)
     else:
@@ -465,7 +524,8 @@ def build(model_name, suite, out, cache_dir, include=(), offline=False, config=N
                                  and reference["questions"] == len(rows))}
     manifest = {
         "schema_version": 1, "name": suite, "model": model_name, "model_repo_id": model["repo_id"],
-        "model_revision": model["revision"], "rendered_family": family, "tokenizer_files": tokenizer_files,
+        "model_revision": model["revision"], "rendered_family": family,
+        **({"reasoning_effort": effort} if family == "inkling2" else {}), "tokenizer_files": tokenizer_files,
         "packages": package_versions(), "max_total_tokens": budget, "questions": len(rows),
         "by_benchmark": dict(sorted(collections.Counter(row["benchmark"] for row in rows).items())),
         "selection": selection, "sources": sources,
@@ -498,17 +558,22 @@ def main(argv=None):
                         help="add an optional Hard benchmark (repeatable)")
     parser.add_argument("--offline", action="store_true",
                         help="use only cached benchmark files and the local Hugging Face cache")
+    parser.add_argument("--reasoning-effort", metavar="LEVEL",
+                        help="Inkling2 only: thinking effort of the prompts, one of "
+                             f"{', '.join(chat.INKLING2_EFFORTS)} or a number in [0, 0.99] "
+                             f"(default: {chat.INKLING2_DEFAULT_EFFORT}, the chat template's default)")
     args = parser.parse_args(argv)
     try:
         manifest = build(args.model, args.suite, args.out, args.cache_dir, tuple(sorted(set(args.include))),
-                         args.offline)
+                         args.offline, reasoning_effort=args.reasoning_effort)
     except (IntegrityError, SourceUnavailable, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     reference = manifest["reference"]
-    print(json.dumps({"suite": manifest["name"], "model": manifest["model"], "questions": manifest["questions"],
-                      "by_benchmark": manifest["by_benchmark"], "catalog_sha256": manifest["catalog_sha256"],
-                      "prompt_digest": manifest["prompt_digest"],
+    effort = {key: manifest[key] for key in ("reasoning_effort",) if key in manifest}
+    print(json.dumps({"suite": manifest["name"], "model": manifest["model"], **effort,
+                      "questions": manifest["questions"], "by_benchmark": manifest["by_benchmark"],
+                      "catalog_sha256": manifest["catalog_sha256"], "prompt_digest": manifest["prompt_digest"],
                       "matches_paper_catalog": reference["matches"] if reference else None}, indent=2))
     if reference and not reference["matches"]:
         print(f"warning: the {reference['name']} catalog differs from the paper's ({reference['catalog_sha256']}); "

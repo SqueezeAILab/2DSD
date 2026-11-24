@@ -1,0 +1,15 @@
+--- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
++++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
+@@ -89,7 +89,11 @@
+     )
+     if sp is None:
+         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
+-        if current_platform.is_device_capability_family(120):
++        if current_platform.is_device_capability_family(120) or (
++            # Pod patch: this image's native kernels are built for SM10x only (no sm_90 SASS),
++            # so Hopper takes the SM12x fallback (Triton short_conv + attn_res).
++            current_platform.is_device_capability_family(90)
++        ):
+             # Native conv/mix kernels require Hopper or SM10x. Keep the
+             # loop executor's cache writes and residual rounding on SM12x.
+             short_conv(

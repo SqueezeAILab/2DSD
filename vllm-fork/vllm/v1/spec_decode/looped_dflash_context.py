@@ -8,12 +8,20 @@ cursor to the drafting parent enters as that parent's loop-d features, projected
 per request. The block holds the anchor token embedding and k - 1 mask
 embeddings and attends to the prefix, its span and itself bidirectionally. A
 parent that has finished loop R has an empty span: standard DFlash.
+
+An export with DSpark heads (loopedtf_drafter.dspark) decides the drafted tokens left to right after the
+one backbone pass, each with the Markov head's bias from the token before it, and every drafted token comes
+with the confidence head's acceptance probability. Its block is the same anchor and k - 1 masks unless the
+export sets sample_from_anchor (the DSpark paper's block): then the anchor's slot predicts the first
+drafted token and a request for k - 1 drafted tokens runs k - 1 slots, the anchor and k - 2 masks. The
+padded grid graphs cover only the former.
 """
 
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
 from itertools import accumulate
+from pathlib import Path
 import time
 from typing import Any
 
@@ -112,6 +120,77 @@ class _FastGraph:
     ids: torch.Tensor | None = None     # [L*(K-1)] token IDs
 
 
+def _states(hidden):
+    """Stands in for the logits callable of an adapter whose heads read the slots' backbone states."""
+    return hidden
+
+
+@dataclass
+class _DSparkHeads:
+    """speculators' DSpark heads of an export: the sequential (Markov) head, whose bias on a slot's logits
+    comes from the token before it, and the confidence head."""
+
+    kind: str                     # "vanilla", "gated" or "rnn"
+    w1: torch.Tensor              # [V, r] embedding of the previous token
+    w2: torch.Tensor              # [V, r] projection of the rank-r latent to logits
+    projection: tuple | None      # (weight, bias) of the gate ("gated") or the joint recurrence ("rnn")
+    confidence: tuple             # (weight [H + r], bias) over [backbone state, previous token embedding]
+    wide_base: bool = False       # the target head returns FP32 logits and training summed them as such
+
+    @classmethod
+    def load(cls, path, settings, device, dtype):
+        from safetensors import safe_open
+
+        kind = settings["markov_head_type"]
+        with safe_open(Path(path) / "model.safetensors", framework="pt") as handle:
+            get = lambda name: handle.get_tensor(name).to(device=device, dtype=dtype)
+            projection = {"gated": "gate_proj", "rnn": "joint_proj"}.get(kind)
+            heads = cls(kind, get("markov_head.markov_w1.weight"), get("markov_head.markov_w2.weight"),
+                        projection and (get(f"markov_head.{projection}.weight"), get(f"markov_head.{projection}.bias")),
+                        (get("confidence_head.proj.weight")[0], get("confidence_head.proj.bias")[0]))
+        if kind not in ("vanilla", "gated", "rnn") or heads.w1.shape[1] != settings["markov_rank"]:
+            raise ValueError("Unsupported DSpark head")
+        return heads
+
+    def draft_base(self, base):
+        """The head's logits as a greedy draft adds the Markov bias to them: in the heads' dtype. On a GPU
+        that is BF16, the arithmetic of training (BF16 logits plus a BF16 bias), which also keeps the slot
+        loop's sums and argmax over the vocabulary in half the bytes. Drafted tokens are the same as with an
+        FP32 sum except at near-ties, and acceptance does not move (measured on 128 prompts).
+
+        ``wide_base`` keeps the head's own dtype: a head that scales its logits in FP32 after the GEMM
+        (Dory's) gave training FP32 logits, and rounding them to BF16 first drafts another token at about one
+        slot in a hundred."""
+        return base if self.wide_base else base.to(self.w2.dtype)
+
+    def step(self, hidden, previous, state, w2=None):
+        """One slot of n blocks: its backbone states [n, H], the tokens before it [n] and the recurrent
+        state [n, r] -> the logit bias [n, V], confidence logits [n] and the next state. ``w2`` (rows of
+        the Markov projection) gives the bias of those tokens only."""
+        embedding = latent = self.w1[previous]
+        if self.kind == "gated":
+            latent = torch.sigmoid(F.linear(torch.cat((hidden, embedding), -1), *self.projection)) * embedding
+        elif self.kind == "rnn":
+            gate, candidate, latent = F.linear(torch.cat((state, embedding, hidden), -1), *self.projection).chunk(3, -1)
+            gate = torch.sigmoid(gate)
+            state, latent = gate * state + (1.0 - gate) * torch.tanh(candidate), torch.tanh(latent)
+        weight, bias = self.confidence
+        projection = self.w2 if w2 is None else w2
+        return latent @ projection.T, torch.cat((hidden, embedding), -1) @ weight + bias, state
+
+
+@dataclass
+class _DSparkLoop:
+    """The slot loop of ``count`` blocks of the same length as one CUDA graph: the backbone states of the
+    blocks' slots and the token before each block go in, the drafted tokens and confidences come out."""
+
+    hidden: torch.Tensor                     # [count * slots, H], blocks in order
+    head: torch.Tensor                       # [count]
+    tokens: torch.Tensor | None = None       # [count, slots]
+    confidence: torch.Tensor | None = None   # [count, slots]
+    graph: Any = None
+
+
 def drafting_grid(loops: int, block: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Default padded drafting grid: leaves per call and span rows per leaf.
 
@@ -152,6 +231,11 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         self._grid_pool = None
         self.grid_eager = False  # run grid calls with the same padded layout but no graph (bitwise checks)
         self._fast: _FastGrid | None = None  # configure_fast_grid
+        self.dspark: _DSparkHeads | None = None  # from_export; the query passes then return backbone states
+        self.first_slot = 1  # the first block row that predicts: 0 when the anchor's slot drafts (DSpark)
+        self.readout: Callable | None = None     # with DSpark heads: the logits callable
+        self._dspark_loops: dict[tuple[int, int], _DSparkLoop] = {}
+        self._draft_vocabulary: tuple | None = None  # configure_draft_vocabulary: (ids, readout, w2 rows)
         self._fast_host = self._fast_upload = None
         self.stats.update({
             "context_graph_captures": 0, "context_graph_replays": 0,
@@ -175,6 +259,12 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         drafter = adapter.config.get("loopedtf_drafter", {})
         if drafter.get("input_format") != "loop-context":
             raise ValueError("This export was not trained with loop-context inputs")
+        if drafter.get("dspark"):
+            adapter.dspark = _DSparkHeads.load(path, drafter["dspark"], adapter.device, adapter.dtype)
+            adapter.dspark.wide_base = drafter.get("target_head", {}).get("kind") == "dory-scaled"
+            adapter.first_slot = 0 if drafter["dspark"]["sample_from_anchor"] else 1
+            # The heads read the slots' backbone states, so the query passes return those.
+            adapter.readout, adapter.lm_head = adapter.lm_head, _states
         if fast_grid:
             adapter.configure_fast_grid(**({} if fast_grid is True else fast_grid))
         return adapter
@@ -218,6 +308,8 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
             raise ValueError("Invalid number of in-graph prefix rows")
         if head_weight is None and (head_scale is not None or vocab_ids is not None):
             raise ValueError("A head scale or vocabulary needs the head weight")
+        if head_weight is not None and self.dspark is not None:
+            raise ValueError("DSpark heads read the slots' backbone states; keep the logits outside the graph")
         head = scale = ids = None
         if head_weight is not None:
             if head_weight.ndim != 2 or head_weight.shape[1] != self.hidden_size:
@@ -292,6 +384,8 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         self, requests: Sequence[Mapping[str, Any]]
     ) -> list[DraftResult]:
         """Greedy drafts: k - 1 token IDs per request, none for k = 1."""
+        if self.dspark is not None:
+            return [DraftResult(tokens, confidence) for tokens, confidence, _ in self._dspark_outputs(requests)]
         # Argmax allocates owned IDs outside the graph; avoid copying full-vocab
         # logits just to consume them immediately. A fast grid graph returns the IDs themselves.
         outputs, tokens = self._context_outputs(requests, owned=False, tokens=True)
@@ -305,11 +399,127 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
             for x in outputs
         ]
 
+    def _dspark_outputs(self, requests, logits=False):
+        """DSpark drafting: one backbone pass, then the slots left to right. A slot's logits are the head's
+        logits of its backbone state plus the Markov head's bias from the token before it (the given token
+        for the first slot); its confidence is the confidence head's acceptance probability. Per request:
+        token IDs [k - 1], confidences [k - 1] and, with ``logits``, the corrected logits [k - 1, V].
+
+        The logits callable returns logits before any monotone cap, which the argmax does not need."""
+        states, _ = self._context_outputs(requests, owned=False)
+        heads = self.dspark
+        live = [i for i, x in enumerate(states) if x is not None]
+        sizes = [states[i].shape[0] for i in live]
+        if (live and not logits and self.use_cuda_graph and self.device.type == "cuda"
+                and sizes[0] > 0 and all(size == sizes[0] for size in sizes)):
+            # Blocks of one length: the readout and the slots replay from a graph, with no host round trip
+            # between slots. Blocks of several lengths and the logits take the loop below.
+            loop = self._dspark_loop(len(live), sizes[0])
+            torch.cat([states[i] for i in live], out=loop.hidden)
+            loop.head.copy_(torch.tensor([int(requests[i]["head"]) for i in live], device=self.device))
+            loop.graph.replay()
+            self.stats["graph_replays"] += 1
+            empty = torch.empty(0, device=self.device, dtype=torch.long)
+            found = {i: n for n, i in enumerate(live)}
+            # Copies: the graph's outputs are rewritten by the next call of this shape.
+            return [(loop.tokens[found[i]].clone(), loop.confidence[found[i]].clone(), None) if i in found
+                    else (empty, None, None) for i in range(len(requests))]
+        tokens = {i: [] for i in live}
+        confidences = {i: [] for i in live}
+        rows = {i: [] for i in live}
+        if live:
+            hidden = torch.cat([states[i] for i in live])
+            ids, readout, w2 = (None, self.readout, None) if logits or not self._draft_vocabulary \
+                else self._draft_vocabulary
+            base = readout(hidden)  # every slot in one pass
+            if not logits:
+                base = heads.draft_base(base)
+            starts = [0, *accumulate(sizes)]
+            previous = torch.tensor([int(requests[i]["head"]) for i in live], device=self.device)
+            state = hidden.new_zeros(len(live), heads.w1.shape[1])
+            for slot in range(max(sizes)):
+                keep = [n for n, size in enumerate(sizes) if size > slot]
+                index = torch.tensor(keep, device=self.device)
+                at = torch.tensor([starts[n] + slot for n in keep], device=self.device)
+                bias, confidence, state[index] = heads.step(hidden[at], previous[index], state[index], w2)
+                corrected = base[at] + bias.to(base.dtype)
+                chosen = corrected.argmax(-1)
+                if ids is not None:
+                    chosen = ids[chosen]
+                previous[index] = chosen
+                confidence = torch.sigmoid(confidence.float())
+                for row, n in enumerate(keep):
+                    tokens[live[n]].append(chosen[row])
+                    confidences[live[n]].append(confidence[row])
+                    if logits:
+                        rows[live[n]].append(corrected[row])
+        empty = torch.empty(0, device=self.device, dtype=torch.long)
+        return [(torch.stack(tokens[i]), torch.stack(confidences[i]), torch.stack(rows[i]) if logits else None)
+                if i in tokens else (empty, None, None) for i in range(len(requests))]
+
+    def _dspark_slots(self, loop, count, slots):
+        """The slot loop of ``_dspark_outputs`` for ``count`` blocks of ``slots`` slots: tokens and
+        confidences [count, slots]."""
+        heads = self.dspark
+        ids, readout, w2 = self._draft_vocabulary or (None, self.readout, None)
+        hidden = loop.hidden.view(count, slots, -1)
+        base = heads.draft_base(readout(loop.hidden)).view(count, slots, -1)
+        previous = loop.head
+        state = loop.hidden.new_zeros(count, heads.w1.shape[1])
+        tokens, confidences = [], []
+        for slot in range(slots):
+            bias, confidence, state = heads.step(hidden[:, slot], previous, state, w2)
+            previous = (base[:, slot] + bias.to(base.dtype)).argmax(-1)
+            if ids is not None:
+                previous = ids[previous]
+            tokens.append(previous)
+            confidences.append(torch.sigmoid(confidence.float()))
+        return torch.stack(tokens, 1), torch.stack(confidences, 1)
+
+    def configure_draft_vocabulary(self, ids, readout):
+        """Restrict a DSpark drafter's drafts to the sorted token IDs ``ids``.
+
+        ``readout`` maps backbone states [n, H] to the logits [n, len(ids)] of those tokens, before any
+        cap. The slot loop then reads only those rows of the head and of the Markov projection: a token
+        outside ``ids`` is never drafted (the target still produces it). ``context_logits`` keeps the
+        whole vocabulary. Off unless called.
+        """
+        if self.dspark is None:
+            raise ValueError("A drafting vocabulary needs DSpark heads")
+        ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
+        if (ids.ndim != 1 or ids.numel() == 0 or bool((ids[1:] <= ids[:-1]).any()) or int(ids[0]) < 0
+                or int(ids[-1]) >= self.dspark.w2.shape[0]):
+            raise ValueError("The drafting vocabulary is a sorted list of distinct token IDs of the head")
+        self._draft_vocabulary = (ids, readout, self.dspark.w2[ids].contiguous())
+        self._dspark_loops.clear()
+
+    def _dspark_loop(self, count, slots):
+        """The graph of the slot loop for this many blocks of this length, captured on first use."""
+        loop = self._dspark_loops.get((count, slots))
+        if loop is None:
+            started = time.perf_counter()
+            loop = self._dspark_loops[count, slots] = _DSparkLoop(
+                torch.zeros(count * slots, self.hidden_size, dtype=self.dtype, device=self.device),
+                torch.zeros(count, dtype=torch.long, device=self.device))
+            for _ in range(2):  # also compiles the kernels of this shape
+                self._dspark_slots(loop, count, slots)
+            torch.cuda.synchronize(self.device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                loop.tokens, loop.confidence = self._dspark_slots(loop, count, slots)
+            loop.graph = graph
+            self.stats["graph_captures"] += 1
+            self.stats["capture_seconds"] += time.perf_counter() - started
+        return loop
+
     @torch.inference_mode()
     def context_logits(
         self, requests: Sequence[Mapping[str, Any]]
     ) -> list[torch.Tensor | None]:
-        """Draft-slot logits [k - 1, V] per request; one shared weight pass."""
+        """Draft-slot logits [k - 1, V] per request; one shared weight pass. With DSpark heads: the
+        corrected logits along the greedy draft, before any cap of the target's head."""
+        if self.dspark is not None:
+            return [rows for _, _, rows in self._dspark_outputs(requests, logits=True)]
         return self._context_logits(requests, owned=True)
 
     def _context_logits(self, requests, *, owned):
@@ -327,7 +537,8 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
                 or int(r["prefix_len"]) != prefix_len
             ):
                 raise ValueError("Batched drafts require one shared verified prefix")
-            if not 1 <= r["k"] <= self.block_size:
+            # block_size counts the slots of a block; k the anchor and the drafted tokens.
+            if not 1 <= r["k"] <= self.block_size + 1 - self.first_slot:
                 raise ValueError("Invalid drafter block length")
         results: list[torch.Tensor | None] = [None] * len(requests)
         active = [(index, r) for index, r in enumerate(requests) if r["k"] > 1]
@@ -350,7 +561,7 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         parents = [prefix_len - 1 + n for n in lengths]
         if any(p + r["k"] + 1 > self.max_len for p, (_, r) in zip(parents, active)):
             raise ValueError("Drafter token capacity exceeded")
-        block_lengths = [r["k"] for _, r in active]
+        block_lengths = [r["k"] - 1 + self.first_slot for _, r in active]  # slots (rows) of each block
         layout = tuple(zip(lengths, block_lengths))
         self.layout_counts[layout] = self.layout_counts.get(layout, 0) + 1
         shape = self._grid_shape(lengths, block_lengths)
@@ -404,7 +615,7 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         local_lengths = [n + k for n, k in zip(lengths, block_lengths)]
         vectors = ([int(r["head"]) for _, r in active], bounds[:-1],
                    [row for start, k in zip(bounds, block_lengths)
-                    for row in range(start + 1, start + k)])
+                    for row in range(start + self.first_slot, start + k)])
         sizes = [len(v) for v in vectors]
         cu_vectors = (bounds, [0, *accumulate(local_lengths)], [0, prefix_len])
         metadata = torch.tensor(
@@ -437,7 +648,7 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
         actual = {
             "query_rows": sum(block_lengths),
             "span_rows": sum(lengths),
-            "readout_rows": sum(k - 1 for k in block_lengths),
+            "readout_rows": sum(k - self.first_slot for k in block_lengths),
             "prefix_pairs": sum(block_lengths) * prefix_len,
             "local_pairs": sum(k * (n + k) for n, k in zip(lengths, block_lengths)),
         }
@@ -646,6 +857,9 @@ class ContextDFlashAdapter(LoopedDFlashAdapter):
                   "graphs": 0, "seconds": 0.0}
         if not (self.native and self.use_cuda_graph) or block < 2:
             return report
+        if self.first_slot != 1:
+            raise NotImplementedError("The padded grid graphs read out the masks after the anchor; a drafter "
+                                      "whose anchor slot predicts runs the layout path")
         if (not leaves or not spans or list(leaves) != sorted(set(leaves)) or list(spans) != sorted(set(spans))
                 or leaves[0] < 1 or spans[0] < 0 or block > self.block_size):
             raise ValueError("Invalid drafting graph grid")

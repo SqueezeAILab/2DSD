@@ -13,12 +13,20 @@ import torch
 from .blocks import Packed
 
 
-def load_traces(path, max_len, limit=0, seed=0):
-    """Non-degenerate traces of one pool file; `limit` keeps a seeded, domain-stratified subset."""
+def load_traces(path, max_len, limit=0, seed=0, expect=None):
+    """Non-degenerate traces of one pool file; `limit` keeps a seeded, domain-stratified subset.
+
+    `expect` maps fields of a trace row (its `model`, its `target_config_sha256`) to the values of the model
+    the drafter trains for: a row that names another one is refused, so that the traces of one model do not
+    train the drafter of another by accident."""
     docs, stats = [], {"rows": 0, "degenerate": 0, "too_short": 0, "length_capped": 0, "loop_stopped": 0, "sampled": 0}
     for line in Path(path).read_text().splitlines():
         r = json.loads(line)
         stats["rows"] += 1
+        for key, want in (expect or {}).items():
+            if r.get(key) is not None and r[key] != want:
+                raise ValueError(f"{path}: trace {r['id']} has {key} {r[key]!r} and the drafter trains for {want!r}. "
+                                 "These are the traces of another model (--allow-other-target trains on them anyway)")
         if r["degenerate"]:
             stats["degenerate"] += 1
             continue
